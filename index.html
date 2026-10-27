@@ -307,7 +307,7 @@ let base = null, info = null, ws = null, authed = false, failures = 0;
 let mode = store.get('mode') || 'chat';
 let crop = store.get('crop') !== 'full';
 let frame = { w: 1000, h: 800 }, panel = null, zoom = 1, tapMode = 'tap', rightNext = false;
-let windows = [], currentWindow = null;
+let windows = [], sshRecent = [], currentWindow = null;
 
 // Keep the layout above the on-screen keyboard.
 function fitViewport() {
@@ -576,7 +576,7 @@ function connect() {
     else if (m.t === 'chat') renderChat(m.chat);
     else if (m.t === 'frame') onFrame(m);
     else if (m.t === 'panel') { panel = m.rect; layoutStage(); applyQuality(); }
-    else if (m.t === 'windows') { windows = m.list; currentWindow = m.current; if (sheetKind === 'windows') showWindows(); }
+    else if (m.t === 'windows') { windows = m.list; sshRecent = m.ssh || []; currentWindow = m.current; if (sheetKind === 'windows') showWindows(); }
     else if (m.t === 'attached') {
       store.set('window', m.id);
       currentWindow = m.id;
@@ -638,7 +638,10 @@ function winLabel(title) {
 function showWindows() {
   const rows = windows.map(w => `<button class="opt ${w.id === currentWindow ? 'cur' : ''}" data-win="${esc(w.id)}">
     <span class="tag">${KIND_TAG[w.kind] || ''}</span><span class="lbl">${esc(winLabel(w.title || w.id).name)}${winLabel(w.title || '').file ? `<span class="sub">${esc(winLabel(w.title).file)}</span>` : ''}</span></button>`).join('');
-  openSheet('windows', `<h3>切换 Cursor 窗口</h3>${rows || '<div class="hint">没有找到窗口</div>'}`);
+  const sshRows = sshRecent.map(s => `<button class="opt" data-ssh-host="${esc(s.host)}" data-ssh-root="${esc(s.root)}">
+    <span class="tag">${s.open ? '重连' : '打开'}</span><span class="lbl">${esc(s.name)}<span class="sub">${esc(s.host)} · ${esc(s.root)}</span></span></button>`).join('');
+  openSheet('windows', `<h3>切换 Cursor 窗口</h3>${rows || '<div class="hint">没有找到窗口</div>'}
+    ${sshRows ? `<h3>SSH 项目</h3>${sshRows}<div class="hint">这里是电脑上 Cursor 最近打开过的 SSH 目录。没开窗口时会新开一个；断线时会重新连接。第一次连接可能要等一会儿，主机指纹或密码仍要在电脑上确认。</div>` : ''}`);
 }
 $('title').onclick = () => { send({ t: 'windows' }); showWindows(); };
 
@@ -852,6 +855,7 @@ $('sheet').addEventListener('click', async e => {
   const b = e.target.closest('button');
   if (!b) return;
   if (b.dataset.win) { closeSheet(); return send({ t: 'attach', id: b.dataset.win }); }
+  if (b.dataset.sshHost) { closeSheet(); status('正在连接 SSH…'); return send({ t: 'openSsh', host: b.dataset.sshHost, root: b.dataset.sshRoot }); }
   if (b.dataset.kind) { closeSheet(); status('切换中…'); return send({ t: 'pickMenu', kind: b.dataset.kind, label: b.dataset.label }); }
   if (b.dataset.chopen) { closeSheet(); return openFile(b.dataset.chopen); }
   if (b.dataset.ch) {
