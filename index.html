@@ -46,6 +46,11 @@
   .msg { margin: 8px 0; min-width: 0; overflow-wrap: anywhere; }
   .human { display: flex; justify-content: flex-end; }
   .human .bubble { max-width: 88%; background: #264f78; color: #fff; padding: 8px 12px; border-radius: 14px 14px 4px 14px; white-space: pre-wrap; }
+  .human .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .human .thumbs:last-child { margin-bottom: 0; }
+  .human .thumbs img, .human .thumbs .ph { width: 84px; height: 84px; object-fit: cover; border-radius: 8px; background: rgba(255,255,255,.16); display: block; }
+  .human .thumbs img { cursor: pointer; }
+  .human .thumbs .ph.fail { opacity: .35; }
   .assistant { padding: 2px 2px; }
   .assistant p { margin: 0 0 .6em; }
   .assistant ul, .assistant ol { margin: 0 0 .6em; padding-left: 1.3em; }
@@ -588,6 +593,7 @@ function connect() {
     else if (m.t === 'changes') showChanges(m);
     else if (m.t === 'file') showFile(m);
     else if (m.t === 'image') resolveImageWait(m.id, m);
+    else if (m.t === 'thumbs') applyThumbs(m.items);
     else if (m.t === 'status') {
       status(m.msg, m.ok);
       if (!m.ok && imageWaits.size) resolveImageWait(imageWaits.keys().next().value, m);
@@ -939,10 +945,49 @@ function buttonsHtml(labels, item) {
     `<button class="${PRIMARY.test(l) ? 'primary' : ''}" data-item="${esc(item)}" data-n="${n}">${esc(l)}</button>`).join('');
 }
 
+const thumbCache = new Map();
+const thumbWait = new Set();
+function thumbHtml(paths) {
+  if (!paths?.length) return '';
+  return `<div class="thumbs">${paths.map(p => {
+    const src = thumbCache.get(p);
+    return src ? `<img data-thumb="${esc(p)}" src="${src}" alt="">` : `<span class="ph" data-thumb="${esc(p)}"></span>`;
+  }).join('')}</div>`;
+}
+function requestThumbs(paths) {
+  const need = [];
+  for (const p of paths) {
+    if (!p || thumbCache.has(p) || thumbWait.has(p) || need.includes(p)) continue;
+    if (need.length >= 12) break;
+    need.push(p);
+  }
+  if (!need.length) return;
+  for (const p of need) thumbWait.add(p);
+  send({ t: 'thumbs', paths: need });
+}
+function applyThumbs(items) {
+  for (const it of items || []) {
+    thumbWait.delete(it.path);
+    thumbCache.set(it.path, it.image || '');
+  }
+  for (const el of itemsEl.querySelectorAll('[data-thumb]')) {
+    const src = thumbCache.get(el.dataset.thumb);
+    if (src && el.tagName !== 'IMG') {
+      const img = document.createElement('img');
+      img.dataset.thumb = el.dataset.thumb;
+      img.alt = '';
+      img.src = src;
+      el.replaceWith(img);
+    } else if (src === '') el.classList.add('fail');
+  }
+  const more = [...itemsEl.querySelectorAll('.thumbs .ph:not(.fail)')].map(el => el.dataset.thumb);
+  if (more.length) requestThumbs(more);
+}
+
 function renderItem(it) {
   const el = document.createElement('div');
   el.className = 'msg ' + it.k;
-  if (it.k === 'human') el.innerHTML = `<div class="bubble">${esc(it.t || '')}</div>`;
+  if (it.k === 'human') el.innerHTML = `<div class="bubble">${thumbHtml(it.imgs)}${esc(it.t || '')}</div>`;
   // it.h comes from the whitelist sanitizer in server.mjs (pageHelpers.clean): plain tags only, text escaped.
   else if (it.k === 'assistant') el.innerHTML = it.h || '';
   else if (it.k === 'tool') {
@@ -984,6 +1029,7 @@ function renderChat(chat) {
     return el;
   });
   itemsEl.replaceChildren(...els);
+  requestThumbs(chat.items.flatMap(it => it.imgs || []));
   const live = new Set(chat.items.map(it => it.i));
   for (const k of cache.keys()) if (!live.has(k)) cache.delete(k);
 
@@ -1107,6 +1153,8 @@ $('toBottom').onclick = () => { list.scrollTop = list.scrollHeight; };
 $('older').onclick = () => send({ t: 'scrollChat', dy: -900 });
 
 document.addEventListener('click', async e => {
+  const thumb = e.target.closest('#items .thumbs img');
+  if (thumb?.dataset.thumb) return openFile(thumb.dataset.thumb);
   const b = e.target.closest('button[data-item]');
   const f = !b && e.target.closest('#items [data-file]');
   if (f) return openFile(f.dataset.file);
