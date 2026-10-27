@@ -250,7 +250,7 @@
   <div class="row">
     <textarea id="text" rows="1" placeholder="发给 Cursor Agent…" enterkeyhint="send"></textarea>
     <button id="img" title="附加图片" aria-label="附加图片"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5-9 9"/></svg></button>
-    <input id="imgFile" type="file" accept="image/*" hidden>
+    <input id="imgFile" type="file" accept="image/*" multiple hidden>
     <button id="mic" title="语音输入" aria-label="语音输入"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
     <button id="send">发送</button>
   </div>
@@ -574,7 +574,7 @@ function connect() {
     else if (m.t === 'params') showParams(m);
     else if (m.t === 'changes') showChanges(m);
     else if (m.t === 'file') showFile(m);
-    else if (m.t === 'status') status(m.msg, m.ok);
+    else if (m.t === 'status') { status(m.msg, m.ok); statusWait?.(m); statusWait = null; }
   };
 }
 
@@ -1292,33 +1292,55 @@ const addVoiceText = s => {
 window.onVoice = s => { $('mic').classList.remove('on'); s ? (addVoiceText(s), status('')) : status('没听清，再试一次', false); };
 // Photos from phone cameras are several MB; shrink to something the model can read and the relay accepts.
 async function shrinkImage(file) {
-  if (/^image\/(png|jpeg|gif|webp)$/.test(file.type) && file.size < 600e3) return file;
+  if (/^image\/(png|jpeg|gif|webp)$/.test(file.type) && file.size < 500e3) return file;
   const bmp = await createImageBitmap(file);
-  let side = 1600, q = 0.85, blob;
-  do {
-    const k = Math.min(1, side / Math.max(bmp.width, bmp.height));
-    const c = document.createElement('canvas');
-    c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
-    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
-    blob = await new Promise(r => c.toBlob(r, 'image/jpeg', q));
-    side *= 0.75; q -= 0.1;
-  } while (blob.size > 1.5e6 && q > 0.4);
-  return new File([blob], file.name.replace(/\.\w+$/, '') + '.jpg', { type: 'image/jpeg' });
+  let side = 1280, q = 0.8, blob;
+  try {
+    do {
+      const k = Math.min(1, side / Math.max(bmp.width, bmp.height));
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(bmp.width * k)); c.height = Math.max(1, Math.round(bmp.height * k));
+      c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+      blob = await new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(new Error('encode')), 'image/jpeg', q));
+      side *= 0.75; q -= 0.12;
+    } while (blob.size > 900e3 && q > 0.4);
+  } finally {
+    bmp.close?.();
+  }
+  return new File([blob], (file.name || 'image').replace(/\.\w+$/, '') + '.jpg', { type: 'image/jpeg' });
 }
+
+let statusWait = null;
+function waitStatus(ms = 20000) {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      if (statusWait) { statusWait = null; resolve({ ok: false, msg: '附加图片超时，请再试一次' }); }
+    }, ms);
+    statusWait = m => { clearTimeout(timer); resolve(m); };
+  });
+}
+const readDataUrl = file => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
 
 $('img').onclick = () => $('imgFile').click();
 $('imgFile').onchange = async () => {
-  const file = $('imgFile').files[0];
+  const files = [...$('imgFile').files];
   $('imgFile').value = '';
-  if (!file) return;
-  status('正在处理图片…');
-  try {
-    const img = await shrinkImage(file);
-    const url = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(img); });
+  if (!files.length) return;
+  if (!ws || ws.readyState !== 1 || !authed) return status('未连接', false);
+  let done = 0;
+  for (let i = 0; i < files.length; i++) {
+    status(files.length > 1 ? `正在处理图片 ${i + 1}/${files.length}…` : '正在处理图片…');
+    let img;
+    try { img = await shrinkImage(files[i]); }
+    catch { return status(files.length > 1 ? `第 ${i + 1} 张读不了，已停在这里` : '读不了这张图片，换一张试试', false); }
+    const url = await readDataUrl(img);
+    const ack = waitStatus();
     send({ t: 'image', data: url.slice(url.indexOf(',') + 1), name: img.name, type: img.type });
-  } catch {
-    status('读不了这张图片，换一张试试', false);
+    const result = await ack;
+    if (!result.ok) return status(files.length > 1 ? `第 ${i + 1} 张失败：${result.msg}` : result.msg, false);
+    done++;
   }
+  status(done > 1 ? `已附加 ${done} 张图片，写好文字后点发送` : '图片已附加到 Cursor 输入框，写好文字后点发送');
 };
 
 $('mic').onclick = () => {
