@@ -137,6 +137,13 @@ const I18N = (() => {
     [/^SSH 连接 (.+) 失败：(.*)$/, 'SSH connection to $1 failed: $2'],
     [/^图片太大（(.+)），请在电脑上看$/, 'Image too large ($1); view it on the computer'],
     [/^未知按键: (.*)$/, 'Unknown key: $1'],
+    [/^正在处理图片 (\d+)\/(\d+)…$/, 'Processing image $1/$2…'],
+    [/^已附加 (\d+) 张图片，写好文字后点发送$/, '$1 images attached; type your message and tap Send'],
+    [/^第 (\d+) 张失败：(.*)$/, 'Image $1 failed: $2'],
+    [/^第 (\d+) 张读不了，已停在这里$/, "Couldn't read image $1; stopped there"],
+    [/^附加图片超时，请再试一次$/, 'Attaching the image timed out; try again'],
+    [/^图片太大，请换一张小一些的$/, 'Image is too large; try a smaller one'],
+    [/^附加图片目前只支持 macOS$/, 'Attaching images is currently supported on macOS only'],
     [/^未知指令: (.*)$/, 'Unknown command: $1'],
     [/^(.*)（(安卓 App|安卓浏览器|Mac 浏览器|浏览器)）$/, (m, a, b) => `${a} (${{ '安卓 App': 'Android app', '安卓浏览器': 'Android browser', 'Mac 浏览器': 'Mac browser', '浏览器': 'browser' }[b]})`],
   ];
