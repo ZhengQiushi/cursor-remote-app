@@ -294,6 +294,7 @@
   <button id="gateBtn" class="primary"></button>
   <a id="gateApp" class="primary-link" hidden>在 App 中打开</a>
   <button id="gateRetry">重试</button>
+  <button id="gateChange" hidden>更换 App 地址</button>
   <div id="gateInfo"></div>
 </div>
 
@@ -354,12 +355,14 @@ function gate({ msg = '', err = false, input = null, retry = false, appLink = nu
   if (appLink) $('gateApp').href = appLink;
   $('gateRetry').hidden = !retry;
   $('gateRetry').textContent = typeof retry === 'string' ? retry : '重试';
+  $('gateChange').hidden = !inApp;
   $('gateInfo').textContent = info?.updated ? '电脑端地址更新于 ' + new Date(info.updated).toLocaleString() : '';
 }
 const ungate = () => $('gate').classList.remove('open');
 $('gateBtn').onclick = () => gateSubmit?.($('gateInput').value.trim());
 $('gateInput').onkeydown = e => { if (e.key === 'Enter') $('gateBtn').click(); };
 $('gateRetry').onclick = () => boot();
+$('gateChange').onclick = () => window.CursorRemoteApp?.changeUrl();
 
 /* ---------- relay discovery & auth ---------- */
 const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
@@ -373,8 +376,13 @@ async function decryptUrl(keyText) {
 }
 
 const offline = msg => Object.assign(new Error(msg), { offline: true });
+function selfBase() {
+  const dir = location.pathname.endsWith('/') ? location.pathname : location.pathname.replace(/[^/]+$/, '');
+  return location.origin + dir.replace(/\/$/, '');
+}
+
 async function resolveBase() {
-  if (info.self) return location.origin;
+  if (info.self) return selfBase();
   if (info.v !== 2 || !info.data) throw offline('电脑端还没有发布地址（或还在用旧版本），请在电脑上重启服务');
   const key = store.get('key');
   if (!key) throw Object.assign(new Error(''), { unpaired: true });
@@ -500,10 +508,14 @@ async function boot() {
   }
   gate({ msg: '正在查找电脑…' });
   let res;
+  const lookup = new AbortController();
+  const lookupTimer = setTimeout(() => lookup.abort(), 12000);
   try {
-    res = await fetch('url.json?t=' + Date.now(), { cache: 'no-store' });
+    res = await fetch('url.json?t=' + Date.now(), { cache: 'no-store', signal: lookup.signal });
   } catch {
     return gate({ msg: '读取失败，请检查手机网络（需要能打开 github.io）', err: true, retry: true });
+  } finally {
+    clearTimeout(lookupTimer);
   }
   info = res.ok ? await res.json().catch(() => null) : null;
   if (!info) return gate({ msg: '还没有找到电脑地址。\n请在电脑上运行 npm run public 并保持窗口开着，约 1 分钟后点重试。', err: true, retry: true });
