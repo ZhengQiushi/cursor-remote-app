@@ -32,13 +32,16 @@
   #title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #title::after { content: "▾"; color: #888; flex: none; }
   .seg { display: flex; flex: none; border: 1px solid #3c3c3c; border-radius: 8px; overflow: hidden; }
-  .seg button { border: none; border-radius: 0; padding: 5px 12px; background: #2d2d2d; }
+  .seg button { border: none; border-radius: 0; padding: 5px 8px; background: #2d2d2d; font-size: 13px; }
   .seg button.on { background: #0e639c; }
   #menuBtn { flex: none; padding: 5px 10px; }
 
   main { flex: 1; min-height: 0; position: relative; }
   .view { position: absolute; inset: 0; display: none; flex-direction: column; min-width: 0; }
   .view.active { display: flex; }
+  #sshFind { flex: none; margin: 10px 12px 0; padding: 10px 12px; }
+  #sshHosts { flex: 1; overflow-y: auto; padding: 8px 12px 16px; }
+  #sshHosts .opt.folder { margin-left: 18px; width: calc(100% - 18px); }
 
   /* chat view */
   #list { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 10px 12px 16px; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
@@ -216,6 +219,7 @@
   <div class="seg">
     <button id="tabChat" class="on">对话</button>
     <button id="tabScreen">画面</button>
+    <button id="tabSsh">SSH</button>
   </div>
   <button id="menuBtn">⋯</button>
 </header>
@@ -255,9 +259,15 @@
       <button id="rightClick">右键</button>
     </div>
   </section>
+
+  <section id="sshView" class="view">
+    <input id="sshFind" placeholder="搜索主机" enterkeyhint="search" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <div class="hint">和 Cursor 左侧 Remote Explorer 里的 SSH TARGETS 相同。点主机名会打开或重新连接；下面是这个主机最近用过的目录。第一次连接可能要等一会儿，主机指纹或密码仍要在电脑上确认。</div>
+    <div id="sshHosts"></div>
+  </section>
 </main>
 
-<footer>
+<footer id="foot">
   <div id="chatTools">
     <button id="pickMode" hidden></button>
     <button id="pickModel" hidden></button>
@@ -594,10 +604,12 @@ function connect() {
     else if (m.t === 'frame') onFrame(m);
     else if (m.t === 'panel') { panel = m.rect; layoutStage(); applyQuality(); }
     else if (m.t === 'windows') { windows = m.list; sshRecent = m.ssh || []; currentWindow = m.current; if (sheetKind === 'windows') showWindows(); }
+    else if (m.t === 'sshTargets') { sshHosts = m.hosts || []; renderSsh(); }
     else if (m.t === 'attached') {
       store.set('window', m.id);
       currentWindow = m.id;
       $('titleText').textContent = winLabel(m.title).name;
+      if (mode === 'ssh') setMode('chat');
       send({ t: 'windows' });
     }
     else if (m.t === 'menu') showMenu(m.kind, m.items, m.max);
@@ -936,17 +948,55 @@ $('sheet').addEventListener('click', async e => {
 /* ---------- mode switching ---------- */
 function setMode(m) {
   mode = m;
-  store.set('mode', m);
+  if (m !== 'ssh') store.set('mode', m);
   $('tabChat').classList.toggle('on', m === 'chat');
   $('tabScreen').classList.toggle('on', m === 'screen');
+  $('tabSsh').classList.toggle('on', m === 'ssh');
   $('chatView').classList.toggle('active', m === 'chat');
   $('screenView').classList.toggle('active', m === 'screen');
+  $('sshView').classList.toggle('active', m === 'ssh');
   $('chatTools').hidden = m !== 'chat';
+  $('foot').hidden = m === 'ssh';
+  if (m === 'ssh') {
+    if (authed) send({ t: 'mode', mode: 'chat' });
+    return loadSsh();
+  }
   if (authed) send({ t: 'mode', mode: m });
   if (m === 'screen') { layoutStage(); applyQuality(); }
 }
 $('tabChat').onclick = () => setMode('chat');
 $('tabScreen').onclick = () => setMode('screen');
+$('tabSsh').onclick = () => setMode('ssh');
+
+let sshHosts = [];
+function loadSsh() {
+  $('sshHosts').innerHTML = '<div class="hint">正在读取 Remote Explorer…</div>';
+  send({ t: 'sshTargets' });
+}
+function renderSsh() {
+  const q = $('sshFind').value.trim().toLowerCase();
+  const list = sshHosts.filter(h => {
+    const blob = [h.host, h.detail, h.user, ...(h.folders || []).flatMap(f => [f.name, f.root])].join(' ').toLowerCase();
+    return !q || blob.includes(q);
+  });
+  if (!list.length) {
+    $('sshHosts').innerHTML = `<div class="hint">${sshHosts.length ? '没有匹配的主机' : '没有找到 SSH 主机。确认电脑上的 Remote Explorer 能看到 SSH TARGETS。'}</div>`;
+    return;
+  }
+  $('sshHosts').innerHTML = list.map(h => {
+    const sub = [h.user, h.detail].filter(Boolean).join(' · ');
+    const folders = (h.folders || []).map(f => `<button class="opt folder" data-ssh-host="${esc(h.host)}" data-ssh-root="${esc(f.root)}"><span class="tag">${f.open ? '已打开' : '目录'}</span><span class="lbl">${esc(f.name)}<span class="sub">${esc(f.root)}</span></span></button>`).join('');
+    return `<button class="opt" data-ssh-host="${esc(h.host)}"><span class="tag">${h.open ? '已打开' : '连接'}</span><span class="lbl">${esc(h.host)}${sub ? `<span class="sub">${esc(sub)}</span>` : ''}</span></button>${folders}`;
+  }).join('');
+}
+$('sshFind').addEventListener('input', renderSsh);
+$('sshHosts').onclick = e => {
+  const b = e.target.closest('button');
+  if (!b?.dataset.sshHost) return;
+  status('正在连接 SSH…');
+  if (b.dataset.sshRoot) send({ t: 'openSsh', host: b.dataset.sshHost, root: b.dataset.sshRoot });
+  else send({ t: 'openSshHost', host: b.dataset.sshHost });
+};
 
 /* ---------- chat view ---------- */
 const list = $('list'), itemsEl = $('items');
