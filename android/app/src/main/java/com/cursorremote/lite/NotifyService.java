@@ -103,7 +103,9 @@ public class NotifyService extends Service {
         while (running) {
             try {
                 JSONObject cfg = new JSONObject(prefs(this).getString(PREF, "{}"));
-                listen(resolveRelay(cfg.getString("app"), cfg.optString("key")), cfg.getString("token"));
+                String relay = cfg.optString("relay", "");
+                if (relay.isEmpty()) relay = resolveRelay(cfg.getString("app"), cfg.optString("key"));
+                listen(relay, cfg.getString("token"));
                 backoff = 2000;
             } catch (Unauthorized e) {
                 // Device was removed or needs 2FA again; the app turns this back on after re-pairing.

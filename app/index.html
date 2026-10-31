@@ -821,9 +821,9 @@ function showDonate() {
 
 function showMainMenu() {
   const notifyItem = notifyOn
-    ? `<button class="opt" data-act="notifyOff"><span class="lbl">通知：已开启<span class="sub">Agent 完成或等你确认时提醒</span></span><span class="tag">关闭</span></button>
+    ? `<button class="opt" data-act="notifyOff"><span class="lbl">通知：已开启<span class="sub">每完成一轮对话发一条，正在看这个对话时不响</span></span><span class="tag">关闭</span></button>
        <button class="opt" data-act="notifyTest"><span class="lbl">发一条测试通知</span></button>`
-    : `<button class="opt" data-act="notifyOn"><span class="lbl">开启通知<span class="sub">Agent 完成或等你确认时提醒</span></span></button>`;
+    : `<button class="opt" data-act="notifyOn"><span class="lbl">开启通知<span class="sub">每完成一轮对话发一条，正在看这个对话时不响</span></span></button>`;
   const update = apkUpdate()
     ? `<button class="opt" data-act="appUpdate"><span class="lbl">更新安卓 App（v${esc(appVersion)} → v${esc(apkUpdate())}）</span><span class="tag">新</span></button>`
     : `<button class="opt" data-act="appUpdate"><span class="lbl">检查 App 更新（当前 v${esc(appVersion)}）</span></button>`;
@@ -892,14 +892,25 @@ let notifyOn = false;
 
 const swReady = () => Promise.race([navigator.serviceWorker.ready, sleep(5000).then(() => { throw new Error('通知组件没有加载，请刷新后再试'); })]);
 const pushSub = async () => webPush() ? (await swReady()).pushManager.getSubscription() : null;
-const nativeConfig = () => JSON.stringify({ app: appAddress(), key: store.get('key') || '', token: store.get('token') || '' });
+const nativeConfig = () => JSON.stringify({
+  app: appAddress(),
+  key: store.get('key') || '',
+  token: tokenGet() || store.get('token') || '',
+  relay: (computerId() ? computerBase(computerId()) : relayRoot()),
+});
 
 // After every connect: refresh the menu state and re-register, since re-pairing gives the device a new id.
 async function syncNotify() {
   try {
     if (nativeNotify()) {
-      notifyOn = window.CursorRemoteApp.notifyEnabled();
-      if (notifyOn) window.CursorRemoteApp.setNotify(nativeConfig());
+      const was = window.CursorRemoteApp.notifyEnabled();
+      // The Huawei app has no Google push, so it keeps its own listener. Turn that on once.
+      if (was || !store.get('notifyAsked')) {
+        if (!was) store.set('notifyAsked', '1');
+        window.CursorRemoteApp.setNotify(nativeConfig());
+        notifyOn = true;
+        if (!was) status('对话完成时会发一条通知。系统若询问，请允许通知。');
+      }
       return;
     }
     const sub = await pushSub();

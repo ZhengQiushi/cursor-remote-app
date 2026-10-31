@@ -614,7 +614,7 @@ function pageHelpers() {
     }
     const lastReply = [...items].reverse().find(el => el.matches('[data-message-kind="assistant"]') || el.querySelector('[data-message-kind="assistant"]'));
     const last = lastReply ? lastReply.innerText.trim().replace(/\s+/g, ' ').slice(0, 160) : '';
-    return { busy, waiting, waitingText, last };
+    return { busy, waiting, waitingText, last, lastId: lastReply ? rowId(lastReply) : '' };
   };
 
   const quickOpenRows = () => {

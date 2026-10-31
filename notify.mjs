@@ -98,8 +98,12 @@ function check(win, w, s) {
   if (s.busy) { w.busy = true; w.idle = 0; return; }
   if (!w.busy || ++w.idle < IDLE_POLLS) return;
   w.busy = false;
-  if (!s.waiting) deliver({ kind: 'done', win: win.id, title: `已完成 · ${name}`, body: s.last || 'Agent 已停止',
-    en: { title: `Done · ${name}`, body: s.last || 'The Agent has stopped' } });
+  // One note per finished reply. The same bubble must not ping again if the stop button flickers.
+  if (s.waiting || (s.lastId && w.doneId === s.lastId)) return;
+  w.doneId = s.lastId || '';
+  const body = s.last || '这一轮对话已经结束';
+  deliver({ kind: 'done', win: win.id, title: `对话完成 · ${name}`, body,
+    en: { title: `Chat finished · ${name}`, body: s.last || 'This turn has finished' } });
 }
 
 // listWindows/openCdp/probe come from the relay so this module shares its CDP code.
