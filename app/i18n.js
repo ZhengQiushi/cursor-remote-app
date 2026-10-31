@@ -35,6 +35,7 @@ const I18N = (() => {
     '还没有电脑连上来。在另一台 Mac 上运行 setup-mac.sh 之后，它会出现在这里。': 'No computers are connected. Run setup-mac.sh on another Mac and it will show up here.',
     '点一台就切过去。已经配对过的电脑不用再配；没配对的，到那台电脑上运行 npm run pair，把链接粘贴进来。': 'Tap a computer to switch. Paired ones connect immediately. For a new one, run npm run pair on that Mac and paste the link.',
     '取消和这台电脑的配对？其他电脑不受影响。之后要在这台电脑上重新运行 npm run pair。': 'Unpair this computer? The others stay paired. Run npm run pair on this computer to use it again.',
+    '关闭预览': 'Close', '放大': 'Zoom', '适合屏幕': 'Fit',
     '对话完成时会发一条通知。系统若询问，请允许通知。': 'You\'ll get a notification when a chat finishes. Allow notifications if the system asks.',
     '每完成一轮对话发一条，正在看这个对话时不响': 'One alert when a turn finishes. Silent while you are looking at that chat.',
     'SSH 项目': 'SSH projects',
@@ -186,7 +187,7 @@ const I18N = (() => {
   const tr = s => lang === 'zh' || s == null ? s : String(s).split('\n').map(line).join('\n');
 
   // Content mirrored from Cursor or the computer's files is never translated.
-  const SKIP = '#items, #vBody, #vName, #vPath, #titleText, .qt, [data-label] .lbl, [data-win] .lbl, .qnQ, .qnOpt span';
+  const SKIP = '#items, #vBody, #vName, #vPath, #lightName, #titleText, .qt, [data-label] .lbl, [data-win] .lbl, .qnQ, .qnOpt span';
   const ATTRS = ['placeholder', 'title', 'aria-label'];
   const fix = node => {
     if (node.nodeType === 3) {

@@ -53,7 +53,17 @@
   .human .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
   .human .thumbs:last-child { margin-bottom: 0; }
   .human .thumbs img, .human .thumbs .ph { width: 84px; height: 84px; object-fit: cover; border-radius: 8px; background: rgba(255,255,255,.16); display: block; }
-  .human .thumbs img { cursor: pointer; }
+  .human .thumbs img, .human .thumbs .ph { cursor: pointer; }
+  #lightbox { position: fixed; inset: 0; z-index: 40; background: #000; display: none; flex-direction: column;
+              padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  #lightbox.open { display: flex; }
+  #lightbox .bar { flex: none; display: flex; align-items: center; gap: 8px; padding: 6px 10px; }
+  #lightbox .bar span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #ccc; font-size: 13px; }
+  #lightStage { flex: 1; min-height: 0; overflow: auto; display: flex; align-items: center; justify-content: center; -webkit-overflow-scrolling: touch; }
+  #lightImg { max-width: 100%; max-height: 100%; object-fit: contain; }
+  #lightbox.zoom #lightStage { align-items: flex-start; justify-content: flex-start; }
+  #lightbox.zoom #lightImg { max-width: none; max-height: none; width: auto; height: auto; }
+  #lightNote { flex: none; color: #f77; font-size: 12px; padding: 0 12px 8px; min-height: 0; }
   .human .thumbs .ph.fail { opacity: .35; }
   .assistant { padding: 2px 2px; }
   .assistant p { margin: 0 0 .6em; }
@@ -289,6 +299,16 @@
 
 <div id="shade"></div>
 <div id="sheet"></div>
+
+<div id="lightbox">
+  <div class="bar">
+    <button id="lightClose" type="button">关闭预览</button>
+    <span id="lightName"></span>
+    <button id="lightZoom" type="button">放大</button>
+  </div>
+  <div id="lightStage"><img id="lightImg" alt=""></div>
+  <div id="lightNote"></div>
+</div>
 
 <div id="viewer">
   <div class="bar">
@@ -1317,9 +1337,38 @@ list.addEventListener('scroll', updateToBottom);
 $('toBottom').onclick = () => { list.scrollTop = list.scrollHeight; };
 $('older').onclick = () => send({ t: 'scrollChat', dy: -900 });
 
+function openPreview(path, previewSrc) {
+  if (!path) return;
+  const box = $('lightbox');
+  box.dataset.path = path;
+  box.classList.remove('zoom');
+  $('lightZoom').textContent = '放大';
+  $('lightName').textContent = path.split('/').pop();
+  $('lightNote').textContent = '';
+  const img = $('lightImg');
+  img.src = previewSrc || thumbCache.get(path) || '';
+  box.classList.add('open');
+  send({ t: 'file', path });
+}
+function closePreview() {
+  $('lightbox').classList.remove('open', 'zoom');
+  $('lightImg').removeAttribute('src');
+}
+$('lightClose').onclick = closePreview;
+$('lightbox').addEventListener('click', e => { if (e.target === $('lightbox') || e.target === $('lightStage')) closePreview(); });
+$('lightZoom').onclick = () => {
+  const on = $('lightbox').classList.toggle('zoom');
+  $('lightZoom').textContent = on ? '适合屏幕' : '放大';
+};
+itemsEl.addEventListener('click', e => {
+  const el = e.target.closest('#items [data-thumb]');
+  if (!el) return;
+  e.preventDefault();
+  const src = el.tagName === 'IMG' ? el.src : (thumbCache.get(el.dataset.thumb) || '');
+  openPreview(el.dataset.thumb, src);
+});
+
 document.addEventListener('click', async e => {
-  const thumb = e.target.closest('#items .thumbs img');
-  if (thumb?.dataset.thumb) return openFile(thumb.dataset.thumb);
   const b = e.target.closest('button[data-item]');
   const f = !b && e.target.closest('#items [data-file]');
   if (f) return openFile(f.dataset.file);
@@ -1350,7 +1399,14 @@ function openFile(ref) {
 }
 
 function showFile(m) {
-  if (!$('viewer').classList.contains('open') || m.loading) return;
+  if (m.loading) return;
+  const box = $('lightbox');
+  if (box.classList.contains('open') && (m.req === box.dataset.path || m.path === box.dataset.path)) {
+    if (m.image) $('lightImg').src = m.image;
+    else if (m.error) $('lightNote').textContent = m.error;
+    return;
+  }
+  if (!$('viewer').classList.contains('open')) return;
   $('vName').textContent = m.name || '';
   // Leading LRM keeps the rtl ellipsis from reordering the path's slashes.
   $('vPath').textContent = m.path ? '\u200e' + (m.host ? m.host + ':' : '') + m.path + (m.size != null ? ` · ${fmtSize(m.size)}` : '') : '';

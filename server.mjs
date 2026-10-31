@@ -994,9 +994,9 @@ class Session {
     try {
       const f = await this.resolveFile(text);
       const body = await readFile(f.host, f.path, f.size);
-      this.emit({ t: 'file', name: path.posix.basename(f.path), path: f.path, host: f.host, size: f.size, line: f.line, ...body });
+      this.emit({ t: 'file', name: path.posix.basename(f.path), path: f.path, req: parseRef(text).p, host: f.host, size: f.size, line: f.line, ...body });
     } catch (e) {
-      this.emit({ t: 'file', error: e.message, name: path.posix.basename(parseRef(text).p) });
+      this.emit({ t: 'file', error: e.message, name: path.posix.basename(parseRef(text).p), path: parseRef(text).p, req: parseRef(text).p });
     }
   }
 
