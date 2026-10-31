@@ -1,0 +1,12 @@
+[Unit]
+Description=Cursor Remote bridge
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/cursor-remote-bridge/bridge.py
+Restart=always
+RestartSec=1
+RuntimeDirectory=cursor-remote
+
+[Install]
+WantedBy=multi-user.target

@@ -25,6 +25,7 @@ const APP_DIR = path.join(__dirname, 'app');
 fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 const CONFIG = loadConfig();
+ensureComputer(CONFIG);
 const PUBLIC_URL = String(CONFIG.publicUrl || process.env.CR_PUBLIC_URL || '').replace(/\/$/, '');
 const PUBLISH_REPO = process.argv.find(a => a.startsWith('--publish='))?.slice('--publish='.length) || process.env.CR_PUBLISH_REPO || CONFIG.publishRepo || '';
 const APP_ORIGIN = PUBLISH_REPO ? `https://${PUBLISH_REPO.split('/')[0].toLowerCase()}.github.io` : '';
@@ -32,6 +33,20 @@ const ALLOWED_ORIGINS = new Set([APP_ORIGIN, ...(process.env.CR_ALLOWED_ORIGINS 
 
 function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return {}; }
+}
+
+// Stable id so the phone can tell this Mac from the others on the same bridge.
+function ensureComputer(cfg) {
+  let changed = false;
+  if (!/^[A-Za-z0-9_-]{6,64}$/.test(cfg.computerId || '')) {
+    cfg.computerId = crypto.randomBytes(8).toString('hex');
+    changed = true;
+  }
+  if (!String(cfg.computerName || '').trim()) {
+    cfg.computerName = os.hostname().replace(/\.local$/, '') || 'Mac';
+    changed = true;
+  }
+  if (changed) fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
 }
 
 // A device is usable once paired and, when 2FA asks for it, re-verified.
@@ -1380,7 +1395,12 @@ async function handleApi(req, res, route) {
   const device = deviceFor(req);
 
   if (route === '/api/me') {
-    return json(req, res, 200, { paired: Boolean(device), needTotp: needsTotp(device), totp: Boolean(totpConfig()) });
+    return json(req, res, 200, {
+      paired: Boolean(device),
+      needTotp: needsTotp(device),
+      totp: Boolean(totpConfig()),
+      computer: { id: CONFIG.computerId, name: CONFIG.computerName },
+    });
   }
 
   if (route === '/api/pair' && req.method === 'POST') {
