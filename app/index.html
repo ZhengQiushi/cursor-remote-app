@@ -470,10 +470,12 @@ async function api(path, opts = {}) {
 }
 const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body || {}) });
 
-// Pairing links look like <app>#pair=<url key>.<one-time code>.
+// Pairing links look like <app>#pair=<url key>.<one-time code>[&pc=<computerId>].
 function parsePair(text) {
   const m = /[#&]pair=([\w-]{43})\.([\w-]{16,})/.exec(text || '');
-  return m ? { key: m[1], code: m[2] } : null;
+  if (!m) return null;
+  const pc = /(?:[#&?]pc=)([A-Za-z0-9_-]{6,64})/.exec(text || '')?.[1] || null;
+  return { key: m[1], code: m[2], pc };
 }
 let pending = parsePair(location.hash);
 if (pending) history.replaceState(null, '', location.pathname + location.search);
@@ -533,24 +535,73 @@ function showTotp(onCode, err = '') {
   });
 }
 
+async function pairTargets() {
+  const roots = [];
+  const add = id => {
+    if (!id || !/^[A-Za-z0-9_-]{6,64}$/.test(id)) return;
+    const u = computerBase(id);
+    if (!roots.includes(u)) roots.push(u);
+  };
+  add(pending?.pc);
+  add(computerId());
+  // Shared bridge: /api/pair without /hub/c/<id>/ goes to the first online Mac, which is often not
+  // the one that ran npm run pair. Prefer an explicit pc, otherwise try every online computer.
+  if (!pending?.pc && info?.self) {
+    try {
+      const r = await fetch(relayRoot() + '/hub/computers?t=' + Date.now(), { cache: 'no-store' });
+      if (r.ok) for (const c of (await r.json()).computers || []) add(c.id);
+    } catch {}
+  }
+  if (!roots.length) roots.push(String(base || '').replace(/\/$/, ''));
+  return roots;
+}
+
 async function pair(totp) {
   gate({ msg: '正在配对…' });
-  let r, body;
-  try {
-    r = await post('/api/pair', { code: pending.code, name: deviceName(), totp });
-    body = await r.json().catch(() => ({}));
-  } catch {
-    return gate({ msg: '连不上电脑，配对链接 10 分钟内有效，稍后重试', err: true, retry: true });
+  const payload = { code: pending.code, name: deviceName(), totp };
+  let lastR = null, lastBody = {}, reached = false;
+  const targets = await pairTargets();
+  for (const target of targets) {
+    try {
+      const headers = { 'content-type': 'application/json' };
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 10000);
+      let r, body;
+      try {
+        r = await fetch(target.replace(/\/$/, '') + '/api/pair', { method: 'POST', headers, body: JSON.stringify(payload), signal: ctl.signal, cache: 'no-store' });
+        body = await r.json().catch(() => ({}));
+      } finally {
+        clearTimeout(timer);
+      }
+      reached = true;
+      lastR = r;
+      lastBody = body;
+      const id = pending?.pc || /\/hub\/c\/([^/]+)/.exec(target)?.[1] || null;
+      if (r.ok) {
+        if (id) {
+          store.set('computer', id);
+          base = computerBase(id);
+          rememberComputer({ id, name: id });
+        }
+        tokenSet(body.token);
+        pending = null;
+        return connect();
+      }
+      if (body.needTotp) {
+        if (id) {
+          store.set('computer', id);
+          base = computerBase(id);
+        }
+        return showTotp(code => pair(code), body.error);
+      }
+    } catch {
+      // try the next computer
+    }
   }
-  if (r.ok) {
-    tokenSet(body.token);
-    pending = null;
-    return connect();
-  }
-  if (body.needTotp) return showTotp(code => pair(code), body.error);
+  if (!reached) return gate({ msg: '连不上电脑，配对链接 10 分钟内有效，稍后重试', err: true, retry: true });
   pending = null;
-  if (store.get('token')) return gate({ msg: (body.error || '配对失败') + '\n\n这台设备之前已经配对过，可以继续使用。', err: true, retry: '继续使用' });
-  showUnpaired(body.error || '配对失败');
+  if (store.get('token')) return gate({ msg: (lastBody.error || '配对失败') + '\n\n这台设备之前已经配对过，可以继续使用。', err: true, retry: '继续使用' });
+  showUnpaired(lastBody.error || (lastR ? '配对失败' : '配对失败'));
 }
 
 async function verifyTotp(code) {
@@ -597,6 +648,7 @@ async function boot() {
     return showUnpaired(e.message);
   }
   hubRoot = base.replace(/\/$/, '');
+  if (pending?.pc) store.set('computer', pending.pc);
   const saved = computerId();
   if (saved) base = computerBase(saved);
   if (pending) return pair();

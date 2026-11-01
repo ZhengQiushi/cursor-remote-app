@@ -40,7 +40,8 @@ class Agent:
         try:
             async with self.write_lock:
                 self.writer.write(HEADER.pack(typ, stream_id, len(payload)) + payload)
-                await self.writer.drain()
+                # Bound drain so one congested Mac cannot stall pings/proxy for the others.
+                await asyncio.wait_for(self.writer.drain(), timeout=10)
             return True
         except Exception:
             return False
@@ -71,19 +72,33 @@ class Bridge:
         agent = self.agents.get(self.legacy_id)
         return agent if agent is not None else None
 
+    def pick_legacy(self, prefer=None):
+        if prefer is not None and self.agents.get(prefer.id) is prefer and not prefer.id.startswith("anon-"):
+            self.legacy_id = prefer.id
+            return
+        if self.legacy_id and self.agents.get(self.legacy_id) is not None:
+            return
+        for agent in self.agents.values():
+            if not agent.id.startswith("anon-"):
+                self.legacy_id = agent.id
+                return
+        self.legacy_id = next(iter(self.agents), None)
+
     def rekey(self, agent, new_id, name):
         agent.name = name or new_id
         if agent.id == new_id:
             return
         previous = self.agents.get(new_id)
+        # Same Mac reconnecting: drop only that Mac's stale tunnel. Never touch other computers.
         if previous is not None and previous is not agent:
+            self.log(f"agent replace {new_id} (stale tunnel)")
             previous.writer.close()
         was_legacy = self.legacy_id == agent.id
         if self.agents.get(agent.id) is agent:
             self.agents.pop(agent.id, None)
         agent.id = new_id
         self.agents[new_id] = agent
-        if was_legacy or self.legacy_id is None:
+        if was_legacy or self.legacy_id is None or self.agents.get(self.legacy_id) is None:
             self.legacy_id = new_id
         self.log(f"agent {new_id} {agent.name}")
 
@@ -130,8 +145,9 @@ class Bridge:
         finally:
             if self.agents.get(agent.id) is agent:
                 self.agents.pop(agent.id, None)
-                if self.legacy_id == agent.id:
-                    self.legacy_id = None
+            if self.legacy_id == agent.id or self.agents.get(self.legacy_id) is None:
+                self.legacy_id = None
+                self.pick_legacy()
             await agent.close_streams()
             writer.close()
             self.log(f"agent gone {agent.id}")
@@ -229,15 +245,23 @@ class Bridge:
             head = b"\r\n".join(lines) + b"\r\n\r\n" + head[split + 4:]
         await self.proxy(agent, reader, writer, head)
 
+    async def ping_one(self, agent):
+        if time.monotonic() - agent.last_rx > 50:
+            self.log(f"agent timed out {agent.id}")
+            agent.writer.close()
+            return
+        if not await agent.send(PING, 0, b""):
+            self.log(f"agent ping failed {agent.id}")
+            agent.writer.close()
+
     async def ping(self):
         while True:
             await asyncio.sleep(15)
-            for agent in list(self.agents.values()):
-                if time.monotonic() - agent.last_rx > 50:
-                    self.log(f"agent timed out {agent.id}")
-                    agent.writer.close()
-                    continue
-                await agent.send(PING, 0, b"")
+            # Ping every Mac in parallel. A busy screencast / slow SSH on one machine must not
+            # delay heartbeats for the others — that was kicking the idle computer offline.
+            agents = list(self.agents.values())
+            if agents:
+                await asyncio.gather(*(self.ping_one(a) for a in agents), return_exceptions=True)
 
 
 def route_path(path):

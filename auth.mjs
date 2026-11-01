@@ -42,10 +42,14 @@ export function encryptUrl(url) {
 /* ---------- pairing ---------- */
 
 // The link carries the url key and a one-time code in the #fragment, which browsers never send to any server.
+// When several Macs share one bridge, also pin &pc=<computerId> so the phone hits the Mac that issued the code
+// (legacy /api/pair otherwise goes to whichever agent connected first).
 export function createPairing(appBase) {
   const code = crypto.randomBytes(16).toString('base64url');
   writeJson('pairing.json', { hash: sha256(code), expires: Date.now() + PAIR_TTL });
-  return { link: `${appBase}#pair=${urlKey().toString('base64url')}.${code}`, minutes: PAIR_TTL / 60000 };
+  const cfg = readConfig();
+  const pc = /^[A-Za-z0-9_-]{6,64}$/.test(cfg.computerId || '') ? `&pc=${cfg.computerId}` : '';
+  return { link: `${appBase}#pair=${urlKey().toString('base64url')}.${code}${pc}`, minutes: PAIR_TTL / 60000 };
 }
 
 export function pairingValid(code) {
