@@ -103,6 +103,7 @@ const I18N = (() => {
     '删除这条排队消息？': 'Delete this queued message?',
     '附加图片': 'Attach image', '移除图片': 'Remove image', '图片还在上传': 'Images are still uploading',
     '附加文件': 'Attach file', '移除文件': 'Remove file', '文件还在上传': 'Files are still uploading',
+    '已收到文件，连上之后会附加': 'File received; it will attach once connected',
     '目前只能附加图片和 PDF': 'Only images and PDFs can be attached',
     '这不是有效的 PDF': 'This is not a valid PDF', '文件内容无效': 'Invalid file contents',
     '文件太大，请换一个小一些的（上限 8 MB）': 'File is too large (8 MB limit)',

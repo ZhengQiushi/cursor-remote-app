@@ -8,13 +8,16 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.PowerManager;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.speech.RecognizerIntent;
+import android.util.Base64;
 import android.widget.Toast;
 import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
@@ -25,9 +28,12 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.InputStream;
 import java.util.ArrayList;
 
 // A thin WebView shell around the user's GitHub Pages app, so it installs without Google Play services or PWA support.
@@ -37,9 +43,12 @@ public class MainActivity extends Activity {
     private static final String UPDATE_FILE = "CursorRemote-update.apk";
     private static final int VOICE = 7;
     private static final int PICK = 8;
+    private static final int SHARE_LIMIT = 8 * 1024 * 1024;
     private WebView web;
     private ValueCallback<Uri[]> pickFile;
     private SharedPreferences prefs;
+    private String pendingShare;
+    private boolean pageReady;
 
     private final BroadcastReceiver downloaded = new BroadcastReceiver() {
         @Override
@@ -79,6 +88,14 @@ public class MainActivity extends Activity {
         });
         web.setWebViewClient(new WebViewClient() {
             @Override
+            public void onPageFinished(WebView view, String url) {
+                if (url != null && url.startsWith("https://")) {
+                    pageReady = true;
+                    deliverShare();
+                }
+            }
+
+            @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
                 Uri u = req.getUrl();
                 if ("file".equals(u.getScheme()) || sameOrigin(u, appUrl())) return false;
@@ -101,8 +118,9 @@ public class MainActivity extends Activity {
         if (!openPairLink(getIntent())) {
             String win = getIntent().getStringExtra("win");
             if (win != null) prefs.edit().putString("openWin", win).apply();
-            if (state != null) web.restoreState(state);
-            else load();
+            // Always load the current page. Restoring the WebView kept the pre-update screen on the phone.
+            load();
+            takeShare(getIntent());
         }
         NotifyService.start(this);
     }
@@ -160,9 +178,91 @@ public class MainActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        setIntent(intent);
         if (openPairLink(intent)) return;
         String win = intent.getStringExtra("win");
         if (win != null) web.evaluateJavascript("window.openWin && openWin(" + JSONObject.quote(win) + ")", null);
+        takeShare(intent);
+    }
+
+    // A file shared from WeChat or WPS. Read it now; the grant only lasts for this intent.
+    private void takeShare(Intent intent) {
+        if (intent == null) return;
+        String action = intent.getAction();
+        if (!Intent.ACTION_SEND.equals(action) && !Intent.ACTION_SEND_MULTIPLE.equals(action)) return;
+        ArrayList<Uri> uris = new ArrayList<>();
+        if (Intent.ACTION_SEND_MULTIPLE.equals(action)) {
+            ArrayList<Uri> list = Build.VERSION.SDK_INT >= 33
+                    ? intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri.class)
+                    : intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+            if (list != null) uris.addAll(list);
+        } else {
+            Uri one = Build.VERSION.SDK_INT >= 33
+                    ? intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class)
+                    : intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            if (one != null) uris.add(one);
+        }
+        intent.setAction(null);
+        intent.removeExtra(Intent.EXTRA_STREAM);
+        if (uris.isEmpty()) return;
+        String fallback = intent.getType();
+        new Thread(() -> {
+            JSONArray arr = new JSONArray();
+            for (Uri uri : uris) {
+                try {
+                    arr.put(readShared(uri, fallback));
+                } catch (Exception e) {
+                    JSONObject err = new JSONObject();
+                    try {
+                        err.put("error", e.getMessage() == null ? "读不了这个文件，换一个试试" : e.getMessage());
+                        arr.put(err);
+                    } catch (Exception ignored) {}
+                }
+            }
+            String json = arr.toString();
+            runOnUiThread(() -> {
+                pendingShare = json;
+                deliverShare();
+            });
+        }).start();
+    }
+
+    private JSONObject readShared(Uri uri, String fallbackType) throws Exception {
+        String name = "file";
+        long size = -1;
+        try (Cursor c = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                if (!c.isNull(0)) name = c.getString(0);
+                if (!c.isNull(1)) size = c.getLong(1);
+            }
+        }
+        if (size > SHARE_LIMIT) throw new IllegalStateException("文件太大，请换一个小一些的（上限 8 MB）");
+        ByteArrayOutputStream out = new ByteArrayOutputStream(size > 0 && size <= SHARE_LIMIT ? (int) size : 8192);
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) throw new IllegalStateException("读不了这个文件，换一个试试");
+            byte[] buf = new byte[16384];
+            int n;
+            long total = 0;
+            while ((n = in.read(buf)) >= 0) {
+                total += n;
+                if (total > SHARE_LIMIT) throw new IllegalStateException("文件太大，请换一个小一些的（上限 8 MB）");
+                out.write(buf, 0, n);
+            }
+        }
+        String type = getContentResolver().getType(uri);
+        if (type == null || type.isEmpty()) type = fallbackType == null ? "" : fallbackType;
+        JSONObject item = new JSONObject();
+        item.put("name", name);
+        item.put("type", type);
+        item.put("data", Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP));
+        return item;
+    }
+
+    private void deliverShare() {
+        if (!pageReady || pendingShare == null) return;
+        String payload = pendingShare;
+        pendingShare = null;
+        web.evaluateJavascript("window.takeShared && takeShared(" + JSONObject.quote(payload) + ")", null);
     }
 
     private void enableNotify(String config) {

@@ -752,6 +752,7 @@ function connect() {
       send({ t: 'lang', v: I18N.lang });
       syncNotify();
       setTimeout(checkAppUpdate, 3000);
+      flushShared();
     }
     else if (m.t === 'chat') renderChat(m.chat);
     else if (m.t === 'frame') onFrame(m);
@@ -943,7 +944,8 @@ function showMainMenu() {
 $('menuBtn').onclick = showMainMenu;
 
 const inApp = /CursorRemoteApp/.test(navigator.userAgent);
-const APK_RELEASE = 'https://github.com/Suchenl/cursor-remote-lite/releases/latest/download/CursorRemote.apk';
+const APK_REPO = 'ZhengQiushi/cursor-remote-app';
+const APK_RELEASE = 'https://github.com/' + APK_REPO + '/releases/latest/download/CursorRemote.apk';
 // A copy on the user's own GitHub Pages downloads more reliably in mainland China than GitHub Releases.
 let apkUrl = APK_RELEASE;
 fetch('CursorRemote.apk', { method: 'HEAD' }).then(r => { if (r.ok) apkUrl = new URL('CursorRemote.apk', location.href).href; }).catch(() => {});
@@ -964,9 +966,11 @@ async function checkAppUpdate(manual = false) {
   if (!inApp || !appVersion) return;
   if (!manual && Date.now() - (store.get('apkChecked') || 0) < 6 * 3600e3) return;
   try {
-    const r = await fetch('https://api.github.com/repos/Suchenl/cursor-remote-lite/releases/latest', { cache: 'no-store' });
-    if (!r.ok) throw new Error();
-    store.set('apkLatest', String((await r.json()).tag_name || '').replace(/^v/, ''));
+    const local = await fetch('version.json?t=' + Date.now(), { cache: 'no-store' });
+    if (!local.ok) throw new Error();
+    const v = String((await local.json()).android || '').replace(/^v/, '');
+    if (!v) throw new Error();
+    store.set('apkLatest', v);
     store.set('apkChecked', Date.now());
   } catch {
     if (manual) status('检查更新失败，请稍后再试', false);
@@ -1913,6 +1917,32 @@ $('imgStrip').onclick = async e => {
 const FILE_LIMIT = 8 * 1024 * 1024;
 const isImageFile = f => /^image\//.test(f.type) || /\.(png|jpe?g|gif|webp|heic|heif|bmp)$/i.test(f.name || '');
 const isPdfFile = f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name || '');
+let sharedWait = [];
+function flushShared() {
+  if (!sharedWait.length || !authed) return;
+  const files = sharedWait;
+  sharedWait = [];
+  uploadPicked(files);
+}
+// Files handed over by the Android share sheet (WeChat, WPS). The page may not be connected yet.
+window.takeShared = raw => {
+  let list = [];
+  try { list = JSON.parse(raw); } catch { return; }
+  const files = [];
+  for (const f of list) {
+    if (!f || f.error) { status(f?.error || '读不了这个文件，换一个试试', false); continue; }
+    try {
+      const bytes = Uint8Array.from(atob(f.data || ''), c => c.charCodeAt(0));
+      files.push(new File([bytes], f.name || 'file', { type: f.type || '' }));
+    } catch { status('读不了这个文件，换一个试试', false); }
+  }
+  if (!files.length) return;
+  if (!authed || !ws || ws.readyState !== 1) {
+    sharedWait.push(...files);
+    return status('已收到文件，连上之后会附加');
+  }
+  uploadPicked(files);
+};
 async function uploadPicked(files) {
   if (!files.length) return;
   if (!ws || ws.readyState !== 1 || !authed) return status('未连接', false);
