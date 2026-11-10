@@ -102,7 +102,8 @@ export function sshConfigHosts() {
   return out;
 }
 
-// Window titles look like "file.py — Folder [SSH: host]" or "Folder".
+// Window titles look like "file.py — Folder [SSH: host]", "Folder", or just "Cursor"
+// for an empty remote window (the host is then only on the status bar).
 export function workspaceForTitle(title) {
   const host = /\[SSH: ([^\]]+)\]/.exec(title)?.[1] || null;
   const folder = title.replace(/\s*\[SSH: [^\]]+\]\s*$/, '').split(' — ').pop().replace(/^●\s*/, '').trim();

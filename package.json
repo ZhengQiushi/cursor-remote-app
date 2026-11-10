@@ -1,6 +1,6 @@
 {
   "name": "cursor-remote-lite",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Use your desktop Cursor from your phone: chat with the Agent, approve steps, switch windows/modes/models. Free and self-hosted.",
   "type": "module",
   "main": "server.mjs",

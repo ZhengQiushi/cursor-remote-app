@@ -118,7 +118,7 @@ async function listWindows() {
 }
 
 function windowMatchesSsh(win, target) {
-  const host = /\[SSH: ([^\]]+)\]/.exec(win.title || '')?.[1];
+  const host = win.sshHost || /\[SSH:\s*([^\]]+)\]/.exec(win.title || '')?.[1];
   if (!host || host !== target.host) return false;
   const folder = path.posix.basename(target.root || '');
   return Boolean(folder) && (win.title || '').includes(folder);
@@ -180,6 +180,63 @@ class Cdp {
   }
 }
 
+// Cursor stores an SSH host as hex JSON {"hostName":"..."}, and only the `cursor` CLI
+// honors that authority. `open -a Cursor vscode-remote://...` exits 0 and opens nothing.
+function sshRemoteAuthority(host) {
+  return 'ssh-remote+' + Buffer.from(JSON.stringify({ hostName: host }), 'utf8').toString('hex');
+}
+
+function sshFolderUri(host, root) {
+  const pathPart = (root.startsWith('/') ? root : `/${root}`).split('/').map(encodeURIComponent).join('/');
+  return `vscode-remote://${sshRemoteAuthority(host)}${pathPart}`;
+}
+
+function cursorCli() {
+  if (process.platform === 'darwin') {
+    const mac = '/Applications/Cursor.app/Contents/Resources/app/bin/cursor';
+    if (fs.existsSync(mac)) return mac;
+  }
+  return 'cursor';
+}
+
+function hostFromStatus(label) {
+  const text = String(label || '').replace(/\s+/g, ' ').trim();
+  const m = /(?:^|\s)SSH:\s*(.+)$/.exec(text);
+  return m ? m[1].trim() : '';
+}
+
+// Newer Cursor builds title an empty SSH window just "Cursor". The host is on the status bar.
+async function probeSshHost(win) {
+  const titled = /\[SSH:\s*([^\]]+)\]/.exec(win.title || '')?.[1];
+  if (titled) return titled;
+  const cdp = new Cdp(win.ws);
+  try {
+    const connected = await Promise.race([
+      cdp.connect().then(() => true),
+      new Promise(resolve => setTimeout(() => resolve(false), 2500)),
+    ]);
+    if (!connected) return '';
+    const label = await Promise.race([
+      cdp.evaluate(`(() => {
+        const el = document.getElementById('status.host');
+        return ((el && (el.innerText || el.getAttribute('aria-label'))) || '').replace(/\\s+/g, ' ').trim();
+      })()`),
+      new Promise(resolve => setTimeout(() => resolve(''), 2000)),
+    ]);
+    return hostFromStatus(label);
+  } catch {
+    return '';
+  } finally {
+    cdp.close();
+  }
+}
+
+async function annotateWindows() {
+  const list = await listWindows();
+  await Promise.all(list.map(async w => { w.sshHost = await probeSshHost(w); }));
+  return list;
+}
+
 const MOD = { Alt: 1, Ctrl: 2, Meta: 4, Shift: 8 };
 const NAMED_KEYS = {
   Enter: { code: 'Enter', vk: 13, text: '\r' },
@@ -221,6 +278,29 @@ const composerImagesExpr = body => `(() => {
   ${body}
 })()`;
 const COMPOSER_PILLS = composerImagesExpr('return pills.length;');
+
+// PDF chips sit in the same row as images, but they are plain context pills with a file icon.
+const composerDocsExpr = body => `(() => {
+  const ed = document.querySelector('.aislash-editor-input[contenteditable="true"]')
+    || document.querySelector('.composer-bar [contenteditable="true"]');
+  const root = ed?.closest('.composer-bar') || document;
+  const pills = [...root.querySelectorAll('.context-pill')]
+    .filter(p => !p.closest('.composer-messages-container, .virtualized-composer-messages-row')
+      && !p.classList.contains('context-pill-image')
+      && !p.classList.contains('context-pill-video'));
+  ${body}
+})()`;
+const COMPOSER_DOCS = composerDocsExpr(`return pills.map(p => ({ id: p.id || '', name: (p.getAttribute('title') || '').trim() }));`);
+const MARK_FILE_INPUT = `(() => {
+  document.querySelectorAll('input[data-remote-file]').forEach(el => el.removeAttribute('data-remote-file'));
+  const ed = document.querySelector('.aislash-editor-input[contenteditable="true"]')
+    || document.querySelector('.composer-bar [contenteditable="true"]');
+  const root = ed?.closest('.composer-bar') || document;
+  const input = [...root.querySelectorAll('input[type="file"]')].find(el => /pdf/i.test(el.accept || ''));
+  if (!input) return false;
+  input.setAttribute('data-remote-file', '1');
+  return true;
+})()`;
 
 // Runs inside Cursor's renderer (injected via toString). Emits only whitelisted tags with escaped text, never raw DOM HTML.
 function pageHelpers() {
@@ -471,7 +551,8 @@ function pageHelpers() {
       const item = { i: rowId(el), k };
       if (k === 'human') {
         item.t = (el.querySelector('[data-message-kind="human"], .aislash-editor-input-readonly, .composer-human-message') || el).innerText.trim();
-        const imgs = [...new Set([...el.querySelectorAll('img.image-pill-img')].map(img => imagePath(img.getAttribute('src') || '')).filter(Boolean))];
+        // Sent photos no longer use the image-pill-img class; any workspace image inside the message counts.
+        const imgs = [...new Set([...el.querySelectorAll('img')].map(img => imagePath(img.getAttribute('src') || '')).filter(Boolean))];
         if (imgs.length) item.imgs = imgs;
       }
       else if (k === 'assistant') { const md = el.querySelector('.markdown-root'); item.h = md ? clean(md) : esc(el.innerText); }
@@ -647,7 +728,17 @@ class Session {
     this.mode = 'chat';
     this.lastChat = '';
     this.lastPanel = '';
+    this.queue = Promise.resolve();
+    this.sshWatch = 0;
+    this.sshOpening = '';
     this.idleTimer = setInterval(() => this.pollIfIdle(), 2000);
+  }
+
+  // One queue for phone commands. Slow SSH polling must not sit on it, or image uploads time out behind it.
+  enqueue(fn) {
+    const run = this.queue.then(fn, fn);
+    this.queue = run.then(() => {}, () => {});
+    return run;
   }
 
   async setMode(mode) {
@@ -1010,14 +1101,13 @@ class Session {
   }
 
   async sshTargets() {
-    const list = (await listWindows()).map(({ id, title, kind }) => ({ id, title, kind }));
+    const list = await annotateWindows();
     const recent = sshWorkspaces(80);
-    const sshHost = title => /\[SSH: ([^\]]+)\]/.exec(title || '')?.[1] || '';
     const hosts = sshConfigHosts().map(h => ({
       host: h.host,
       detail: h.hostname !== h.host ? h.hostname : '',
       user: h.user,
-      open: list.some(win => sshHost(win.title) === h.host),
+      open: list.some(win => win.sshHost === h.host),
       folders: recent.filter(w => w.host === h.host).slice(0, 4).map(w => ({
         root: w.root,
         name: path.posix.basename(w.root) || w.root,
@@ -1028,37 +1118,89 @@ class Session {
   }
 
   async openSshHost(host) {
-    const known = sshConfigHosts().find(h => h.host === host);
-    if (!known) throw new Error('这个主机不在 Remote Explorer 的 SSH 列表里');
-    const uri = `vscode-remote://ssh-remote+${encodeURIComponent(host)}/`;
-    await run('open', ['-a', 'Cursor', uri]);
-    let win = null;
-    for (let i = 0; i < 40; i++) {
-      win = (await listWindows()).find(w => /\[SSH: ([^\]]+)\]/.exec(w.title)?.[1] === host);
-      if (win) break;
-      await new Promise(r => setTimeout(r, 1000));
+    if (!sshConfigHosts().some(h => h.host === host)) throw new Error('这个主机不在 Remote Explorer 的 SSH 列表里');
+    if (this.sshOpening === host) return;
+    const token = ++this.sshWatch;
+    this.sshOpening = host;
+    this.emit({ t: 'status', ok: true, msg: '正在连接 SSH…' });
+    try {
+      const wins = await annotateWindows();
+      const hit = wins.find(w => w.sshHost === host);
+      if (hit) {
+        await this.attach(hit.id, host);
+        this.emit({ t: 'status', ok: true, msg: `已连接到 ${host}` });
+        this.sshOpening = '';
+        return;
+      }
+      const before = new Set(wins.map(w => w.id));
+      await run(cursorCli(), ['--new-window', '--remote', sshRemoteAuthority(host)]);
+      this.watchNewWindow(token, before, host);
+    } catch (e) {
+      if (this.sshWatch === token) this.sshOpening = '';
+      throw e;
     }
-    if (!win) throw new Error('SSH 窗口还没出现。如果电脑上弹出了指纹或登录确认，先在电脑上处理一下');
-    await this.attach(win.id);
-    this.emit({ t: 'status', ok: true, msg: `已连接到 ${host}` });
   }
 
   async openSsh(host, root) {
     const target = sshWorkspaces(40).find(w => w.host === host && w.root === root);
     if (!target) throw new Error('找不到这个 SSH 项目。先在电脑上用 Cursor 打开过一次，它才会出现在列表里');
-    await run('open', ['-a', 'Cursor', target.uri]);
-    let win = null;
-    for (let i = 0; i < 30; i++) {
-      win = (await listWindows()).find(w => windowMatchesSsh(w, target));
-      if (win) break;
-      await new Promise(r => setTimeout(r, 1000));
+    const key = `${host}\0${root}`;
+    if (this.sshOpening === key) return;
+    const token = ++this.sshWatch;
+    this.sshOpening = key;
+    this.emit({ t: 'status', ok: true, msg: '正在连接 SSH…' });
+    try {
+      const wins = await annotateWindows();
+      const hit = wins.find(w => windowMatchesSsh(w, target));
+      if (hit) {
+        await this.attach(hit.id, host);
+        this.emit({ t: 'status', ok: true, msg: `已连接到 ${host}` });
+        this.sshOpening = '';
+        return;
+      }
+      const before = new Set(wins.map(w => w.id));
+      await run(cursorCli(), ['--folder-uri', sshFolderUri(host, root)]);
+      this.watchNewWindow(token, before, host, root);
+    } catch (e) {
+      if (this.sshWatch === token) this.sshOpening = '';
+      throw e;
     }
-    if (!win) throw new Error('SSH 窗口还没出现。如果电脑上弹出了指纹或登录确认，先在电脑上处理一下');
-    await this.attach(win.id);
-    this.emit({ t: 'status', ok: true, msg: `已连接到 ${target.host}` });
   }
 
-  async attach(targetId) {
+  // The CLI returns before the window exists. Poll off the command queue so a picture upload is not stuck behind it.
+  watchNewWindow(token, before, host, root) {
+    this.waitForSshWindow(token, before, host, root).catch(e => {
+      if (this.sshWatch !== token) return;
+      this.sshOpening = '';
+      this.emit({ t: 'status', ok: false, msg: e.message || 'SSH 窗口还没出现。如果电脑上弹出了指纹或登录确认，先在电脑上处理一下' });
+    });
+  }
+
+  async waitForSshWindow(token, before, host, root) {
+    const folder = root ? path.posix.basename(root) : '';
+    let found = null;
+    for (let i = 0; i < 24 && this.sshWatch === token && !found; i++) {
+      if (i) await new Promise(r => setTimeout(r, 500));
+      const fresh = (await listWindows()).filter(w => !before.has(w.id));
+      const titled = folder ? fresh.find(w => (w.title || '').includes(folder)) : null;
+      // A new remote window is titled "Cursor" until the folder name shows up.
+      found = titled || (!folder || i >= 4 ? fresh[0] : null) || null;
+    }
+    if (!found && this.sshWatch === token) {
+      const labeled = await annotateWindows();
+      found = labeled.find(w => w.sshHost === host && (!folder || (w.title || '').includes(folder))) || null;
+    }
+    if (this.sshWatch !== token) return;
+    if (!found) throw new Error('SSH 窗口还没出现。如果电脑上弹出了指纹或登录确认，先在电脑上处理一下');
+    await this.enqueue(async () => {
+      if (this.sshWatch !== token) return;
+      await this.attach(found.id, host);
+      this.sshOpening = '';
+      this.emit({ t: 'status', ok: true, msg: `已连接到 ${host}` });
+    });
+  }
+
+  async attach(targetId, sshHost = '') {
     this.detach();
     const wins = await listWindows();
     const win = wins.find(w => w.id === targetId) || wins[0];
@@ -1078,7 +1220,7 @@ class Session {
     await cdp.send('Page.enable');
     await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
     await this.refreshViewport();
-    this.emit({ t: 'attached', id: win.id, title: win.title });
+    this.emit({ t: 'attached', id: win.id, title: win.title, sshHost: sshHost || '' });
     await this.setMode(this.mode);
   }
 
@@ -1232,7 +1374,16 @@ class Session {
         n = await this.cdp.evaluate(COMPOSER_PILLS);
       }
       if (n <= before) throw new Error('Cursor 没有接收这张图片（当前模型可能不支持图片）');
-      this.emit({ t: 'image', ok: true, id: this.imageId, index: n - 1 });
+      let saved = '';
+      for (let i = 0; i < 8 && !saved; i++) {
+        if (i) await new Promise(r => setTimeout(r, 150));
+        const src = await this.cdp.evaluate(composerImagesExpr(`
+          const pill = pills[${n - 1}];
+          return pill?.querySelector('img')?.getAttribute('src') || '';
+        `));
+        saved = imageFileFromSrc(src);
+      }
+      this.emit({ t: 'image', ok: true, id: this.imageId, index: n - 1, path: saved });
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -1276,16 +1427,110 @@ class Session {
     this.emit({ t: 'image', ok: true, id: this.imageId, removed: i });
   }
 
+  // Cursor's paperclip only ingests images, PDFs and videos. PDFs go through its real file input.
+  async attachFile(data, name, type) {
+    const pdf = type === 'application/pdf' || /\.pdf$/i.test(String(name || ''));
+    if (!pdf) throw new Error('目前只能附加图片和 PDF');
+    if (typeof data !== 'string' || !/^[A-Za-z0-9+/=]+$/.test(data)) throw new Error('文件内容无效');
+    if (data.length > 12_000_000) throw new Error('文件太大，请换一个小一些的（上限 8 MB）');
+    const buf = Buffer.from(data, 'base64');
+    if (!buf.length) throw new Error('文件内容无效');
+    if (buf.length > 8 * 1024 * 1024) throw new Error('文件太大，请换一个小一些的（上限 8 MB）');
+    if (!buf.subarray(0, Math.min(buf.length, 1024)).includes(Buffer.from('%PDF'))) throw new Error('这不是有效的 PDF');
+    const found = await this.cdp.evaluate(FOCUS_COMPOSER);
+    if (!found) throw new Error('没找到可见的聊天输入框：先在画面里打开 Agent 面板（或点「打开聊天」）');
+    const before = await this.cdp.evaluate(COMPOSER_DOCS);
+    const beforeIds = new Set(before.map(d => d.id).filter(Boolean));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-remote-file-'));
+    const fileName = safeUploadName(name, '.pdf');
+    const abs = path.join(dir, fileName);
+    try {
+      fs.writeFileSync(abs, buf);
+      if (!await this.cdp.evaluate(MARK_FILE_INPUT)) throw new Error('没找到上传文件的按钮');
+      const foundNode = await this.cdp.send('Runtime.evaluate', { expression: `document.querySelector('input[data-remote-file="1"]')` });
+      const objectId = foundNode.result?.objectId;
+      if (foundNode.exceptionDetails || !objectId) throw new Error('没找到上传文件的按钮');
+      try {
+        // requestNode returns nodeId 0 for this input; the backend id is the one setFileInputFiles accepts.
+        await this.cdp.send('DOM.enable').catch(() => {});
+        const described = await this.cdp.send('DOM.describeNode', { objectId });
+        const backendNodeId = described.node?.backendNodeId;
+        if (!backendNodeId) throw new Error('没找到上传文件的按钮');
+        await this.cdp.send('DOM.setFileInputFiles', { backendNodeId, files: [abs] });
+      } finally {
+        await this.cdp.send('Runtime.releaseObject', { objectId }).catch(() => {});
+        await this.cdp.evaluate(`document.querySelector('input[data-remote-file="1"]')?.removeAttribute('data-remote-file')`).catch(() => {});
+      }
+      let added = null;
+      let docs = before;
+      for (let i = 0; i < 80 && !added; i++) {
+        await new Promise(r => setTimeout(r, 250));
+        docs = await this.cdp.evaluate(COMPOSER_DOCS);
+        added = docs.find(d => d.id && !beforeIds.has(d.id)) || null;
+        if (!added && docs.length > before.length) added = docs[docs.length - 1];
+      }
+      if (!added) throw new Error('Cursor 没有接收这个文件（只支持图片和 PDF）');
+      const index = Math.max(0, docs.findIndex(d => added.id ? d.id === added.id : d === added));
+      this.emit({ t: 'attachFile', ok: true, id: this.imageId, index, pillId: added.id || '' });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  async removeDocument(index, pillId) {
+    const before = await this.cdp.evaluate(COMPOSER_DOCS);
+    let at = before.findIndex(d => pillId && d.id === pillId);
+    if (at < 0) at = Number(index);
+    if (!Number.isInteger(at) || at < 0 || at >= before.length) throw new Error('没有找到这个文件');
+    const spot = await this.cdp.evaluate(composerDocsExpr(`
+      const pill = pills[${at}];
+      if (!pill) return null;
+      pill.scrollIntoView({ block: 'nearest', inline: 'center' });
+      const r = pill.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    `));
+    if (!spot) throw new Error('这个文件已经不在输入框里');
+    await this.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: spot.x, y: spot.y });
+    await new Promise(r => setTimeout(r, 160));
+    const btn = await this.cdp.evaluate(composerDocsExpr(`
+      const pill = pills[${at}];
+      if (!pill) return null;
+      const close = pill.querySelector('.codicon-close');
+      if (!close) return null;
+      const r = close.getBoundingClientRect();
+      if (r.width <= 0) return null;
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    `));
+    if (!btn) throw new Error('没有找到这个文件的删除按钮');
+    await this.tapCss(btn.x, btn.y);
+    const goneId = before[at].id;
+    let left = before;
+    for (let k = 0; k < 16; k++) {
+      await new Promise(r => setTimeout(r, 80));
+      left = await this.cdp.evaluate(COMPOSER_DOCS);
+      if (goneId ? !left.some(d => d.id === goneId) : left.length < before.length) {
+        this.emit({ t: 'attachFile', ok: true, id: this.imageId, removed: at });
+        return;
+      }
+    }
+    throw new Error('没有找到这个文件的删除按钮');
+  }
+
   async handle(msg) {
     if (msg.t === 'windows') {
-      const list = (await listWindows()).map(({ id, title, kind }) => ({ id, title, kind }));
+      const list = await annotateWindows();
       const ssh = sshWorkspaces().map(w => ({
         host: w.host,
         root: w.root,
         name: path.posix.basename(w.root) || w.root,
         open: list.some(win => windowMatchesSsh(win, w)),
       }));
-      return this.emit({ t: 'windows', list, ssh, current: this.targetId });
+      return this.emit({
+        t: 'windows',
+        list: list.map(({ id, title, kind, sshHost }) => ({ id, title, sshHost: sshHost || '', kind: sshHost ? 'ssh' : kind })),
+        ssh,
+        current: this.targetId,
+      });
     }
     if (msg.t === 'openSsh') return this.openSsh(msg.host, msg.root);
     if (msg.t === 'sshTargets') return this.sshTargets();
@@ -1309,8 +1554,22 @@ class Session {
       case 'stop': return this.stopAgent();
       case 'subagent': return this.subagentAction(msg.name, msg.part === 'stop' ? 'stop' : 'open');
       case 'mainChat': return this.backToMain();
-      case 'image': this.imageId = msg.id; return this.attachImage(msg.data, msg.name, msg.type);
-      case 'removeImage': this.imageId = msg.id; return this.removeImage(msg.index);
+      case 'image':
+        this.imageId = msg.id;
+        try { return await this.attachImage(msg.data, msg.name, msg.type); }
+        catch (e) { this.emit({ t: 'image', id: msg.id, ok: false, msg: e.message }); throw e; }
+      case 'removeImage':
+        this.imageId = msg.id;
+        try { return await this.removeImage(msg.index); }
+        catch (e) { this.emit({ t: 'image', id: msg.id, ok: false, msg: e.message }); throw e; }
+      case 'attachFile':
+        this.imageId = msg.id;
+        try { return await this.attachFile(msg.data, msg.name, msg.type); }
+        catch (e) { this.emit({ t: 'attachFile', id: msg.id, ok: false, msg: e.message }); throw e; }
+      case 'removeFile':
+        this.imageId = msg.id;
+        try { return await this.removeDocument(msg.index, msg.pillId); }
+        catch (e) { this.emit({ t: 'attachFile', id: msg.id, ok: false, msg: e.message }); throw e; }
       case 'question': return this.answerQuestion(msg.qi, msg.oi, ['option', 'submit', 'skip'].includes(msg.part) ? msg.part : 'option', msg.text);
       case 'changes': return this.listChanges();
       case 'change': return this.changeAction(msg.i, msg.name, msg.act);
@@ -1332,6 +1591,8 @@ class Session {
   }
 
   dispose() {
+    this.sshWatch++;
+    this.sshOpening = '';
     clearInterval(this.idleTimer);
     clearTimeout(this.ackTimer);
     this.detach();
@@ -1482,7 +1743,7 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404, SECURITY_HEADERS).end('not found');
 });
 
-const wss = new WebSocketServer({ noServer: true, maxPayload: 4 << 20 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 14 << 20 });
 
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://x');
@@ -1497,7 +1758,6 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', (ws, req) => {
   let session = null;
   const authTimer = setTimeout(() => ws.close(4001, 'auth timeout'), 5000);
-  let queue = Promise.resolve();
   ws.on('message', raw => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
@@ -1517,7 +1777,7 @@ wss.on('connection', (ws, req) => {
     }
     // Frame acks bypass the queue so a slow command never stalls the stream.
     if (msg.t === 'ack') return session.ack();
-    queue = queue.then(async () => {
+    session.enqueue(async () => {
       try {
         const queued = await session.handle(msg);
         if (msg.t === 'type') session.emit({ t: 'status', ok: true, msg: '已发送' });
@@ -1555,6 +1815,23 @@ function workspaceImagesRoot() {
   if (process.platform === 'darwin') return path.join(os.homedir(), 'Library/Application Support/Cursor/User/workspaceStorage');
   if (process.platform === 'win32') return path.join(process.env.APPDATA || '', 'Cursor', 'User', 'workspaceStorage');
   return path.join(os.homedir(), '.config/Cursor/User/workspaceStorage');
+}
+
+function safeUploadName(name, ext) {
+  const base = path.basename(String(name || 'file')).replace(/[/\\]/g, '');
+  const cleaned = base.replace(/[^\w.\- ()\u4e00-\u9fff]+/g, '_').replace(/^\.+/, '').slice(0, 80);
+  if (cleaned.toLowerCase().endsWith(ext)) return cleaned;
+  return `${cleaned || 'file'}${ext}`;
+}
+
+// vscode-file://vscode-app/<abs path>?t=… → the absolute path, or '' if it is not a chat image.
+function imageFileFromSrc(src) {
+  try {
+    const u = new URL(String(src || ''));
+    if (u.protocol !== 'vscode-file:') return '';
+    const p = decodeURIComponent(u.pathname);
+    return /\/workspaceStorage\/[^/]+\/images\/[^/]+\.(png|jpe?g|gif|webp)$/i.test(p) ? p : '';
+  } catch { return ''; }
 }
 
 // Only files Cursor itself saved for a chat attachment. Anything else is refused.
