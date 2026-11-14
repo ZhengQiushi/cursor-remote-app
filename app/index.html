@@ -124,7 +124,9 @@
   .tools { flex: none; display: flex; gap: 6px; padding: 6px 8px; overflow-x: auto; scrollbar-width: none; background: #252526; border-bottom: 1px solid #333; min-width: 0; }
   .tools::-webkit-scrollbar { display: none; }
   #termState { align-self: center; font-size: 12px; color: #999; margin-right: auto; white-space: nowrap; }
-  #termBox { flex: 1; min-height: 0; background: #1e1e1e; padding: 4px 0 0 6px; overflow: hidden; }
+  @font-face { font-family: "Terminal Mono"; font-weight: 400; font-display: block; src: url("jetbrains-mono-400.woff2") format("woff2"); }
+  @font-face { font-family: "Terminal Mono"; font-weight: 700; font-display: block; src: url("jetbrains-mono-700.woff2") format("woff2"); }
+  #termBox { flex: 1; min-height: 0; background: #1e1e1e; padding: 4px 4px 0 6px; overflow: hidden; }
   #termBox .xterm { height: 100%; }
   #termKeys { border-top: 1px solid #333; border-bottom: 0; }
   #termKeys button { flex: none; }
@@ -1215,12 +1217,16 @@ let termScreen = null, termFit = null, termOpen = false, termSize = '';
 function termEnsure() {
   if (termScreen) return;
   termScreen = new Terminal({
-    fontSize: 13, fontFamily: 'Menlo, Consolas, monospace', cursorBlink: true, scrollback: 5000,
+    // The bundled mono font has the same metrics everywhere; the phone's default monospace has no CJK glyphs,
+    // and the mismatch clipped the lines.
+    fontSize: 12, lineHeight: 1.35, fontFamily: '"Terminal Mono", monospace', cursorBlink: true, scrollback: 5000,
     theme: { background: '#1e1e1e', foreground: '#d4d4d4' },
   });
   termFit = new FitAddon.FitAddon();
   termScreen.loadAddon(termFit);
   termScreen.open($('termBox'));
+  // Measure the cells only once the font has loaded, or the columns are computed for the wrong glyphs.
+  document.fonts.load('12px "Terminal Mono"').then(() => { termFit.fit(); termFitSend(); }).catch(() => {});
   // Keys typed on the terminal itself (the soft keyboard lands in it when the screen is tapped).
   termScreen.onData(data => { if (termOpen) send({ t: 'term_in', data }); });
   new ResizeObserver(() => termFitSend()).observe($('termBox'));
