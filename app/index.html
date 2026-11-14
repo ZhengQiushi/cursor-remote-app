@@ -130,6 +130,9 @@
   #termBox .xterm { height: 100%; }
   #termKeys { border-top: 1px solid #333; border-bottom: 0; }
   #termKeys button { flex: none; }
+  #termActions { border-top: 1px solid #333; }
+  #termActions button { flex: none; }
+  #termPreview { flex: none; height: 30px; width: 30px; object-fit: cover; border-radius: 4px; align-self: center; cursor: pointer; }
   #termForm { flex: none; display: flex; gap: 8px; padding: 8px; background: #252526; border-top: 1px solid #333; }
   #termForm input { flex: 1; min-width: 0; font-size: 16px; padding: 9px 10px; border-radius: 8px; border: 1px solid #444; background: #1e1e1e; color: #eee; }
   #termForm button { flex: none; padding: 9px 14px; border-radius: 8px; background: #0e639c; color: #fff; border: 0; }
@@ -283,6 +286,16 @@
       <button data-tkey="backspace">⌫</button>
       <button data-tkey="ctrlc">Ctrl+C</button>
     </div>
+    <div id="termActions" class="tools">
+      <button id="termPic">图片</button>
+      <button id="termFile">文件</button>
+      <button id="termHistory">历史</button>
+      <button id="termModel">模型</button>
+      <button id="termMode">模式</button>
+      <img id="termPreview" alt="" hidden>
+    </div>
+    <input id="termPicInput" type="file" accept="image/*" hidden>
+    <input id="termFileInput" type="file" hidden>
     <form id="termForm" autocomplete="off">
       <input id="termInput" placeholder="输入文字，发送后自动回车" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false">
       <button type="submit">发送</button>
@@ -768,6 +781,7 @@ function connect() {
     else if (m.t === 'chat') renderChat(m.chat);
     else if (m.t === 'term') termWrite(m);
     else if (m.t === 'term_exit') termEnded(m.code);
+    else if (m.t === 'term_file') termFileDone(m);
     else if (m.t === 'windows') { windows = m.list; sshRecent = m.ssh || []; currentWindow = m.current; windowHint = m.hint || ''; if (sheetKind === 'windows') showWindows(); }
     else if (m.t === 'sshTargets') { sshHosts = m.hosts || []; renderSsh(); }
     else if (m.t === 'attached') {
@@ -1300,6 +1314,64 @@ $('termForm').onsubmit = e => {
   if (text) send({ t: 'term_in', data: text });
   setTimeout(() => send({ t: 'term_in', data: '\r' }), 80);
 };
+
+// Upload buttons: a picture or file is saved in the project's temp/ folder, then its path is typed
+// into the terminal (no Enter), so the person can add their words before sending.
+const TERM_UPLOAD_MAX = 8 * 1024 * 1024;
+let termUploadSeq = 0;
+const termUploads = new Map();
+
+function termPickFile(input) {
+  input.value = '';
+  input.onchange = () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    termUpload(file);
+  };
+  input.click();
+}
+$('termPic').onclick = () => termPickFile($('termPicInput'));
+$('termFile').onclick = () => termPickFile($('termFileInput'));
+
+function termUpload(file) {
+  if (!termOpen) return status('终端没有在运行', false);
+  if (file.size > TERM_UPLOAD_MAX) return status('文件太大，终端上传上限 8 MB', false);
+  const reader = new FileReader();
+  reader.onload = () => {
+    const id = ++termUploadSeq;
+    termUploads.set(id, { file, url: file.type.startsWith('image/') ? URL.createObjectURL(file) : '' });
+    const data = String(reader.result).split(',')[1] || '';
+    send({ t: 'term_file', id, name: file.name, data });
+    status('正在上传…');
+  };
+  reader.onerror = () => status('读取文件失败', false);
+  reader.readAsDataURL(file);
+}
+
+function termFileDone(m) {
+  const item = termUploads.get(m.id);
+  termUploads.delete(m.id);
+  if (!m.ok) return status(m.error || '上传失败', false);
+  if (termOpen) send({ t: 'term_in', data: m.path + ' ' });
+  status('已放入终端输入框');
+  if (item?.url) {
+    const img = $('termPreview');
+    if (img.dataset.url) URL.revokeObjectURL(img.dataset.url);
+    img.src = item.url;
+    img.dataset.url = item.url;
+    img.hidden = false;
+    img.onclick = () => window.open(item.url, '_blank');
+  }
+}
+
+// Shortcuts for the chat's buttons: typed into Claude Code, which runs the same commands.
+$('termHistory').onclick = () => termKeyText('/resume\r');
+$('termModel').onclick = () => termKeyText('/model\r');
+$('termMode').onclick = () => termKeyText('\x1b[Z');
+function termKeyText(data) {
+  if (!termOpen) return status('终端没有在运行', false);
+  send({ t: 'term_in', data });
+}
 
 $('termRestart').onclick = () => {
   if (!authed) return;

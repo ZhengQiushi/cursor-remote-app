@@ -114,6 +114,7 @@ const claudeViewers = new Set();
 // The terminal tab: one Claude Code (or CLAUDE_BIN) on this computer, shared by the phones that open
 // the tab. It keeps running when a phone disconnects, so the conversation is still there on return.
 const terminalViewers = new Set();
+const TERM_FILE_MAX_B64 = 11_000_000; // about 8 MB of file; the socket accepts 14 MB
 const TERMINAL_BIN = whichClaude(process.env.CLAUDE_BIN || '');
 let terminal = null;
 
@@ -1934,6 +1935,30 @@ class Session {
       const old = terminal;
       terminal = null;
       old?.close();
+      return;
+    }
+    if (msg.t === 'term_file') return this.termFile(msg);
+  }
+
+  // A picture or file from the phone is saved into the project's temp/ folder, as the chat does,
+  // and its path is typed into the terminal so Claude Code can read it.
+  async termFile(msg) {
+    const reply = (ok, extra = {}) => this.emit({ t: 'term_file', ok, ...extra });
+    let tmp = '';
+    try {
+      const data = typeof msg.data === 'string' ? msg.data : '';
+      if (!/^[A-Za-z0-9+/=]+$/.test(data) || !data.length) throw new Error('文件内容无效');
+      if (data.length > TERM_FILE_MAX_B64) throw new Error('文件太大，终端上传上限 8 MB');
+      if (!terminal?.alive) throw new Error('终端没有在运行');
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-remote-term-'));
+      tmp = path.join(dir, 'upload');
+      fs.writeFileSync(tmp, Buffer.from(data, 'base64'));
+      const rel = await saveToWorkspaceTemp(null, CLAUDE_CWD, tmp, String(msg.name || 'file'));
+      reply(true, { path: rel, id: msg.id });
+    } catch (e) {
+      reply(false, { error: e.message, id: msg.id });
+    } finally {
+      if (tmp) fs.rmSync(path.dirname(tmp), { recursive: true, force: true });
     }
   }
 
