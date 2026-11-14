@@ -132,7 +132,11 @@
   #termKeys button { flex: none; }
   #termActions { border-top: 1px solid #333; }
   #termActions button { flex: none; }
-  #termPreview { flex: none; height: 30px; width: 30px; object-fit: cover; border-radius: 4px; align-self: center; cursor: pointer; }
+  #termPreviewBar { flex: none; display: flex; align-items: center; gap: 10px; padding: 6px 8px; background: #252526; border-top: 1px solid #333; }
+  #termPreviewBar[hidden] { display: none; }
+  #termPreview { flex: none; height: 64px; max-width: 96px; object-fit: contain; border-radius: 6px; background: #111; cursor: zoom-in; }
+  #termPreviewText { flex: 1; min-width: 0; font-size: 12px; color: #aaa; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #termPreviewClose { flex: none; padding: 4px 10px; }
   #termForm { flex: none; display: flex; gap: 8px; padding: 8px; background: #252526; border-top: 1px solid #333; }
   #termForm input { flex: 1; min-width: 0; font-size: 16px; padding: 9px 10px; border-radius: 8px; border: 1px solid #444; background: #1e1e1e; color: #eee; }
   #termForm button { flex: none; padding: 9px 14px; border-radius: 8px; background: #0e639c; color: #fff; border: 0; }
@@ -292,7 +296,11 @@
       <button id="termHistory">历史</button>
       <button id="termModel">模型</button>
       <button id="termMode">模式</button>
-      <img id="termPreview" alt="" hidden>
+    </div>
+    <div id="termPreviewBar" hidden>
+      <img id="termPreview" alt="">
+      <span id="termPreviewText"></span>
+      <button id="termPreviewClose" aria-label="移除">×</button>
     </div>
     <input id="termPicInput" type="file" accept="image/*" hidden>
     <input id="termFileInput" type="file" hidden>
@@ -1336,32 +1344,55 @@ $('termFile').onclick = () => termPickFile($('termFileInput'));
 function termUpload(file) {
   if (!termOpen) return status('终端没有在运行', false);
   if (file.size > TERM_UPLOAD_MAX) return status('文件太大，终端上传上限 8 MB', false);
+  // The preview comes from the phone's own copy, so it shows at once and does not wait for the upload.
+  termShowPreview(file);
   const reader = new FileReader();
   reader.onload = () => {
     const id = ++termUploadSeq;
-    termUploads.set(id, { file, url: file.type.startsWith('image/') ? URL.createObjectURL(file) : '' });
+    termUploads.set(id, { name: file.name });
     const data = String(reader.result).split(',')[1] || '';
     send({ t: 'term_file', id, name: file.name, data });
-    status('正在上传…');
+    $('termPreviewText').textContent = file.name + ' · 上传中…';
   };
   reader.onerror = () => status('读取文件失败', false);
   reader.readAsDataURL(file);
 }
 
+let termPreviewUrl = '';
+function termShowPreview(file) {
+  if (termPreviewUrl) URL.revokeObjectURL(termPreviewUrl);
+  termPreviewUrl = '';
+  const bar = $('termPreviewBar'), img = $('termPreview');
+  if (file.type.startsWith('image/')) {
+    termPreviewUrl = URL.createObjectURL(file);
+    img.src = termPreviewUrl;
+    img.hidden = false;
+  } else {
+    img.removeAttribute('src');
+    img.hidden = true;
+  }
+  $('termPreviewText').textContent = file.name;
+  bar.hidden = false;
+}
+$('termPreview').onclick = () => { if (termPreviewUrl) window.open(termPreviewUrl, '_blank'); };
+$('termPreviewClose').onclick = () => {
+  if (termPreviewUrl) URL.revokeObjectURL(termPreviewUrl);
+  termPreviewUrl = '';
+  $('termPreview').removeAttribute('src');
+  $('termPreviewBar').hidden = true;
+};
+
 function termFileDone(m) {
   const item = termUploads.get(m.id);
   termUploads.delete(m.id);
-  if (!m.ok) return status(m.error || '上传失败', false);
-  if (termOpen) send({ t: 'term_in', data: m.path + ' ' });
-  status('已放入终端输入框');
-  if (item?.url) {
-    const img = $('termPreview');
-    if (img.dataset.url) URL.revokeObjectURL(img.dataset.url);
-    img.src = item.url;
-    img.dataset.url = item.url;
-    img.hidden = false;
-    img.onclick = () => window.open(item.url, '_blank');
+  const name = item?.name || '';
+  if (!m.ok) {
+    $('termPreviewText').textContent = name + ' · 上传失败';
+    return status(m.error || '上传失败', false);
   }
+  if (termOpen) send({ t: 'term_in', data: m.path + ' ' });
+  $('termPreviewText').textContent = name + ' · 已放入输入框';
+  status('已放入终端输入框');
 }
 
 // Shortcuts for the chat's buttons: typed into Claude Code, which runs the same commands.
