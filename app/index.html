@@ -354,6 +354,7 @@
 <script src="i18n.js"></script>
 <script src="xterm.js"></script>
 <script src="xterm-addon-fit.js"></script>
+<script src="xterm-addon-webgl.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const PRIMARY = /^(run|allow|accept|approve|keep|continue|build|yes|运行|允许|接受|继续)/i;
@@ -1217,16 +1218,24 @@ let termScreen = null, termFit = null, termOpen = false, termSize = '';
 function termEnsure() {
   if (termScreen) return;
   termScreen = new Terminal({
-    // The bundled mono font has the same metrics everywhere; the phone's default monospace has no CJK glyphs,
-    // and the mismatch clipped the lines.
-    fontSize: 12, lineHeight: 1.35, fontFamily: '"Terminal Mono", monospace', cursorBlink: true, scrollback: 5000,
+    // Same font stack and draw path as remote-ai's phone terminal: a CJK mono face for Chinese text,
+    // and WebGL, which draws each cell on its own grid instead of clipping DOM rows.
+    fontSize: 13, lineHeight: 1.12, fontFamily: '"Terminal Mono", "Noto Sans Mono CJK SC", "Droid Sans Mono", monospace',
+    cursorBlink: true, scrollback: 5000,
     theme: { background: '#1e1e1e', foreground: '#d4d4d4' },
   });
   termFit = new FitAddon.FitAddon();
   termScreen.loadAddon(termFit);
   termScreen.open($('termBox'));
+  if (window.WebglAddon) {
+    try {
+      const gl = new WebglAddon.WebglAddon();
+      gl.onContextLoss(() => gl.dispose());
+      termScreen.loadAddon(gl);
+    } catch { /* the DOM renderer is the fallback */ }
+  }
   // Measure the cells only once the font has loaded, or the columns are computed for the wrong glyphs.
-  document.fonts.load('12px "Terminal Mono"').then(() => { termFit.fit(); termFitSend(); }).catch(() => {});
+  document.fonts.load('13px "Terminal Mono"').then(() => { termFit.fit(); termFitSend(); }).catch(() => {});
   // Keys typed on the terminal itself (the soft keyboard lands in it when the screen is tapped).
   termScreen.onData(data => { if (termOpen) send({ t: 'term_in', data }); });
   new ResizeObserver(() => termFitSend()).observe($('termBox'));
