@@ -7,12 +7,15 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import qrcode from 'qrcode-terminal';
-import { workspaces, sshWorkspaces, sshConfigHosts, workspaceForTitle, fileSize, readFile, parseRef } from './files.mjs';
+import { workspaces, sshWorkspaces, sshConfigHosts, workspaceForTitle, fileSize, readFile, parseRef, safeFileName, saveToWorkspaceTemp } from './files.mjs';
+import { ossPut, ossGet, ossDel } from './oss.mjs';
 import {
   DATA_DIR, encryptUrl, createPairing, pairingValid, consumePairing, listDevices, addDevice, findDevice, updateDevice,
   removeDevice, totpConfig, verifyTotp, needsTotp, saveState, appBase,
 } from './auth.mjs';
 import { pushPublicKey, openEventStream, closeEventStreams, addViewer, removeViewer, deliver, startWatcher } from './notify.mjs';
+import { listClaudeClients, inboxFor, stopRelayOwnedSessions, isClaudeBackend, claudeCwd, whichClaude } from './claude.mjs';
+import { TerminalProcess } from './terminal.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3939);
@@ -26,7 +29,11 @@ fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 const CONFIG = loadConfig();
 ensureComputer(CONFIG);
+const CLAUDE_MODE = isClaudeBackend(CONFIG);
+const CLAUDE_CWD = claudeCwd(CONFIG);
 const PUBLIC_URL = String(CONFIG.publicUrl || process.env.CR_PUBLIC_URL || '').replace(/\/$/, '');
+if (CONFIG.modelsApiBase && !process.env.CR_MODELS_API_BASE) process.env.CR_MODELS_API_BASE = CONFIG.modelsApiBase;
+if (CONFIG.modelsApiKey && !process.env.CR_MODELS_API_KEY) process.env.CR_MODELS_API_KEY = CONFIG.modelsApiKey;
 const PUBLISH_REPO = process.argv.find(a => a.startsWith('--publish='))?.slice('--publish='.length) || process.env.CR_PUBLISH_REPO || CONFIG.publishRepo || '';
 const APP_ORIGIN = PUBLISH_REPO ? `https://${PUBLISH_REPO.split('/')[0].toLowerCase()}.github.io` : '';
 const ALLOWED_ORIGINS = new Set([APP_ORIGIN, ...(process.env.CR_ALLOWED_ORIGINS || '').split(',')].filter(Boolean));
@@ -102,7 +109,48 @@ function originAllowed(req) {
   try { return new URL(origin).host === req.headers.host; } catch { return false; }
 }
 
+const claudeViewers = new Set();
+
+// The terminal tab: one Claude Code (or CLAUDE_BIN) on this computer, shared by the phones that open
+// the tab. It keeps running when a phone disconnects, so the conversation is still there on return.
+const terminalViewers = new Set();
+const TERMINAL_BIN = whichClaude(process.env.CLAUDE_BIN || '');
+let terminal = null;
+
+// Session ids are UUIDs (Claude Code); anything else is refused so it cannot reach the command line.
+const SESSION_ID = /^[0-9a-f-]{36}$/i;
+
+function openTerminal(cols, rows, session) {
+  const want = SESSION_ID.test(session || '') ? session : '';
+  if (terminal?.alive && terminal.session === want) {
+    terminal.resize(cols, rows);
+    return false;
+  }
+  // Another conversation is open here: end it first, so the phone gets the one it asked for.
+  if (terminal?.alive) terminal.close();
+  // A terminal that was closed on purpose (restart) must not speak for its successor.
+  const term = new TerminalProcess({
+    argv: want ? [TERMINAL_BIN, '--resume', want] : [TERMINAL_BIN],
+    session: want,
+    cwd: CLAUDE_CWD,
+    cols,
+    rows,
+    onData: data => { if (terminal === term) for (const v of terminalViewers) v.emit({ t: 'term', data }); },
+    onExit: code => { if (terminal === term) for (const v of terminalViewers) v.emit({ t: 'term_exit', code }); },
+  });
+  terminal = term;
+  return true;
+}
+
 async function listWindows() {
+  if (CLAUDE_MODE) {
+    return listClaudeClients().map(c => ({
+      id: c.id,
+      title: c.title,
+      ws: '',
+      kind: 'claude',
+    }));
+  }
   const res = await fetch(`${CDP_URL}/json/list`).catch(() => {
     throw new Error('连不上 Cursor：Cursor 没有用 start-cursor.sh / start-cursor.ps1 启动（调试端口未开启）');
   });
@@ -115,6 +163,21 @@ async function listWindows() {
       ws: t.webSocketDebuggerUrl,
       kind: t.title === 'Cursor Agents' ? 'agents' : /\[SSH: /.test(t.title) ? 'ssh' : 'local',
     }));
+}
+
+function claudeClient(id) {
+  const list = listClaudeClients();
+  return list.find(c => c.id === id) || null;
+}
+
+function openClaudeInbox(id) {
+  const client = claudeClient(id);
+  if (!client) return null;
+  return inboxFor(client, chat => {
+    for (const v of claudeViewers) {
+      if (v.targetId === id) v.emitClaudeChat?.(chat);
+    }
+  });
 }
 
 function windowMatchesSsh(win, target) {
@@ -233,6 +296,10 @@ async function probeSshHost(win) {
 
 async function annotateWindows() {
   const list = await listWindows();
+  if (CLAUDE_MODE) {
+    for (const w of list) w.sshHost = '';
+    return list;
+  }
   await Promise.all(list.map(async w => { w.sshHost = await probeSshHost(w); }));
   return list;
 }
@@ -720,6 +787,8 @@ class Session {
     // The phone reports when the app goes to the background; notifications skip the window it is looking at.
     this.visible = true;
     this.cdp = null;
+    this.claude = null;
+    this.claudeImages = [];
     this.viewport = { w: 1000, h: 800 };
     this.screencast = { format: 'jpeg', quality: 60, maxWidth: 1280, maxHeight: 2400 };
     this.awaitingAck = null;
@@ -731,7 +800,17 @@ class Session {
     this.queue = Promise.resolve();
     this.sshWatch = 0;
     this.sshOpening = '';
+    this.ossUp = new Map();
+    this.ossStaged = new Map();
     this.idleTimer = setInterval(() => this.pollIfIdle(), 2000);
+    if (CLAUDE_MODE) claudeViewers.add(this);
+  }
+
+  emitClaudeChat(chat) {
+    const json = JSON.stringify(chat);
+    if (json === this.lastChat) return;
+    this.lastChat = json;
+    this.emit({ t: 'chat', chat });
   }
 
   // One queue for phone commands. Slow SSH polling must not sit on it, or image uploads time out behind it.
@@ -742,8 +821,22 @@ class Session {
   }
 
   async setMode(mode) {
-    this.mode = mode === 'screen' ? 'screen' : 'chat';
     clearInterval(this.chatTimer);
+    // The terminal tab draws on the phone itself; nothing about Cursor's window needs to be sent.
+    if (mode === 'term') {
+      this.mode = 'term';
+      await this.cdp?.send('Page.stopScreencast').catch(() => {});
+      return;
+    }
+    this.mode = mode === 'screen' ? 'screen' : 'chat';
+    if (CLAUDE_MODE) {
+      if (this.mode === 'screen') {
+        this.emit({ t: 'status', ok: false, msg: 'Claude 模式没有实时画面，请用聊天' });
+        this.mode = 'chat';
+      }
+      if (this.claude) this.emitClaudeChat(this.claude.snapshot());
+      return;
+    }
     if (!this.cdp) return;
     if (this.mode === 'chat') {
       await this.cdp.send('Page.stopScreencast').catch(() => {});
@@ -1202,6 +1295,22 @@ class Session {
 
   async attach(targetId, sshHost = '') {
     this.detach();
+    if (CLAUDE_MODE) {
+      const list = listClaudeClients();
+      const picked = list.find(c => c.id === targetId) || list[0];
+      if (!picked) {
+        this.emit({ t: 'status', ok: false, msg: '没有正在运行的 Claude Code。先在项目目录里运行 claude' });
+        return;
+      }
+      const box = openClaudeInbox(picked.id);
+      this.claude = box;
+      this.targetId = picked.id;
+      this.winTitle = picked.title;
+      this.emit({ t: 'attached', id: picked.id, title: picked.title, sshHost: '' });
+      await this.setMode('chat');
+      this.emitClaudeChat(box.snapshot());
+      return;
+    }
     const wins = await listWindows();
     const win = wins.find(w => w.id === targetId) || wins[0];
     if (!win) throw new Error('没有找到 Cursor 窗口，确认 Cursor 是以 --remote-debugging-port=9222 启动的');
@@ -1226,6 +1335,7 @@ class Session {
 
   detach() {
     clearInterval(this.chatTimer);
+    this.claude = null;
     if (this.cdp) {
       const cdp = this.cdp;
       this.cdp = null;
@@ -1328,6 +1438,8 @@ class Session {
   async sendMessage(text, submit) {
     const found = await this.cdp.evaluate(FOCUS_COMPOSER);
     if (!found) throw new Error('没找到可见的聊天输入框：先在画面里打开 Agent 面板（或点「打开聊天」）');
+    const paths = await this.materializeStaged();
+    if (paths.length) text = paths.join('\n') + (text ? '\n' + text : '');
     const busy = submit && await this.cdp.evaluate(helpersCall('agentState()?.busy'));
     await this.typeText(text);
     if (submit) await this.key('Enter');
@@ -1516,10 +1628,204 @@ class Session {
     throw new Error('没有找到这个文件的删除按钮');
   }
 
+  dropOssUpload(id) {
+    const up = this.ossUp.get(id);
+    if (!up) return;
+    this.ossUp.delete(id);
+    try { fs.closeSync(up.fd); } catch {}
+    fs.rmSync(up.path, { force: true });
+  }
+
+  // Files over 5 MB (and anything Cursor's paperclip cannot take) are staged in OSS,
+  // then downloaded into the open workspace's temp/ when the message is sent.
+  async ossBegin(id, name, size, type) {
+    if (!id || this.ossUp.has(id)) throw new Error('上传已经中断，请重新选文件');
+    const bytes = Number(size) || 0;
+    if (bytes < 0 || bytes > OSS_MAX) throw new Error('文件太大，请换一个小一些的（上限 200 MB）');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-remote-oss-'));
+    const file = path.join(dir, 'part');
+    this.ossUp.set(id, {
+      name: safeFileName(name),
+      type: String(type || ''),
+      size: bytes,
+      path: file,
+      dir,
+      fd: fs.openSync(file, 'w'),
+      got: 0,
+      next: 0,
+    });
+    this.emit({ t: 'oss', id, ok: true, phase: 'begin' });
+  }
+
+  async ossChunk(id, n, data) {
+    const up = this.ossUp.get(id);
+    if (!up || n !== up.next) throw new Error('上传已经中断，请重新选文件');
+    if (typeof data !== 'string' || data.length > 4_000_000) throw new Error('文件内容无效');
+    const buf = Buffer.from(data, 'base64');
+    if (!buf.length) throw new Error('文件内容无效');
+    if (up.got + buf.length > OSS_MAX) throw new Error('文件太大，请换一个小一些的（上限 200 MB）');
+    fs.writeSync(up.fd, buf);
+    up.got += buf.length;
+    up.next++;
+    this.emit({ t: 'oss', id, ok: true, phase: 'chunk', n });
+  }
+
+  async ossEnd(id) {
+    const up = this.ossUp.get(id);
+    if (!up) throw new Error('上传已经中断，请重新选文件');
+    try { fs.closeSync(up.fd); } catch {}
+    this.ossUp.delete(id);
+    try {
+      if (!up.got) throw new Error('文件内容无效');
+      const key = await ossPut(`${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}-${up.name}`, up.path);
+      this.ossStaged.set(id, { name: up.name, key, size: up.got });
+      console.log(`[oss] staged ${up.name} ${(up.got / 1048576).toFixed(1)} MB`);
+      this.emit({ t: 'oss', id, ok: true, phase: 'end' });
+    } finally {
+      fs.rmSync(up.dir, { recursive: true, force: true });
+    }
+  }
+
+  async ossDrop(id) {
+    this.dropOssUpload(id);
+    const staged = this.ossStaged.get(id);
+    if (staged) {
+      this.ossStaged.delete(id);
+      await ossDel(staged.key);
+    }
+    this.emit({ t: 'oss', id, ok: true, dropped: true });
+  }
+
+  async materializeStaged() {
+    if (!this.ossStaged.size) return [];
+    const ws = workspaceForTitle(this.winTitle || '');
+    if (!ws?.root) throw new Error('找不到当前项目目录，先在电脑上打开一个文件夹');
+    this.emit({ t: 'status', ok: true, msg: '正在把文件下载到 temp…' });
+    const rels = [];
+    for (const [id, item] of [...this.ossStaged]) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-remote-oss-'));
+      const tmp = path.join(dir, item.name);
+      try {
+        await ossGet(item.key, tmp);
+        const rel = await saveToWorkspaceTemp(ws.host, ws.root, tmp, item.name);
+        rels.push(rel);
+        this.ossStaged.delete(id);
+        await ossDel(item.key).catch(() => {});
+        console.log(`[oss] ${item.name} → ${rel}`);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    return rels;
+  }
+
+  async handleClaude(msg) {
+    if (!this.claude) throw new Error('尚未连接到 Claude CLI');
+    const c = this.claude;
+    switch (msg.t) {
+      case 'openMenu': {
+        const items = await c.openMenu(msg.kind);
+        return this.emit({ t: 'menu', kind: msg.kind, items, max: null });
+      }
+      case 'pickMenu':
+        await c.pickMenu(msg.kind, msg.label);
+        return this.emit({ t: 'status', ok: true, msg: '已发送到终端' });
+      case 'toggleMax':
+        throw new Error('Claude 模式没有 MAX Mode');
+      case 'params':
+      case 'pickParam':
+        throw new Error('Claude 模型参数请用电脑上的 Claude CLI 设置（或切模型）');
+      case 'newChat':
+        return c.newChat();
+      case 'file':
+        return this.openClaudeFile(String(msg.path ?? ''));
+      case 'click':
+        return c.clickButton(msg.item, msg.n);
+      case 'queue':
+        if (msg.action === 'edit') return c.editQueued(msg.id, String(msg.text ?? ''));
+        if (msg.action === 'remove') return c.removeQueued(msg.id);
+        if (msg.action === 'send') return c.sendQueuedNow(msg.id);
+        throw new Error('不支持的排队操作');
+      case 'stop':
+        return c.interrupt();
+      case 'subagent':
+      case 'mainChat':
+        throw new Error('Claude 模式暂不支持子 Agent 切换');
+      case 'image':
+        this.imageId = msg.id;
+        try { return this.stageClaudeImage(msg); }
+        catch (e) { this.emit({ t: 'image', id: msg.id, ok: false, msg: e.message }); throw e; }
+      case 'removeImage':
+        this.imageId = msg.id;
+        try {
+          const i = Number(msg.index);
+          if (!Number.isInteger(i) || i < 0 || i >= this.claudeImages.length) throw new Error('没有找到这张图片');
+          this.claudeImages.splice(i, 1);
+          this.emit({ t: 'image', ok: true, id: this.imageId, removed: i });
+          return;
+        } catch (e) { this.emit({ t: 'image', id: msg.id, ok: false, msg: e.message }); throw e; }
+      case 'ossBegin':
+      case 'ossChunk':
+      case 'ossEnd':
+      case 'ossDrop':
+      case 'attachFile':
+      case 'removeFile':
+        throw new Error('Claude 模式暂只支持直接发图片；大文件请写进项目后用路径说明');
+      case 'question':
+        return c.answerQuestion(msg.qi, msg.oi, ['option', 'submit', 'skip'].includes(msg.part) ? msg.part : 'option', msg.text);
+      case 'changes': {
+        const s = await c.listChanges();
+        return this.emit({ t: 'changes', ...s });
+      }
+      case 'change':
+        return c.changeAction(msg.i, msg.name, msg.act);
+      case 'scrollChat':
+      case 'tap':
+      case 'wheel':
+      case 'key':
+      case 'type':
+      case 'refresh':
+      case 'quality':
+        return;
+      case 'send': {
+        const images = this.claudeImages.splice(0, this.claudeImages.length);
+        return c.sendMessage(String(msg.text ?? ''), { images, submit: msg.submit !== false });
+      }
+      default:
+        throw new Error(`未知指令: ${msg.t}`);
+    }
+  }
+
+  stageClaudeImage(msg) {
+    if (!/^image\/(png|jpeg|gif|webp)$/.test(msg.type) || typeof msg.data !== 'string' || !/^[A-Za-z0-9+/=]+$/.test(msg.data)) {
+      throw new Error('只支持 PNG / JPEG / GIF / WebP 图片');
+    }
+    if (msg.data.length > 3_000_000) throw new Error('图片太大，请换一张小一些的');
+    const index = this.claudeImages.length;
+    const fakePath = `claude-pending-${Date.now()}-${index}`;
+    this.claudeImages.push({ data: msg.data, type: msg.type, name: msg.name || 'image.jpg', path: fakePath });
+    this.emit({ t: 'image', ok: true, id: this.imageId, index, path: fakePath });
+  }
+
+  async openClaudeFile(text) {
+    this.emit({ t: 'file', loading: true, name: path.posix.basename(parseRef(text).p) });
+    try {
+      const { p, line } = parseRef(text);
+      if (!p) throw new Error('不是文件路径');
+      const abs = path.isAbsolute(p) ? p : path.resolve(this.claude?.cwd || CLAUDE_CWD, p);
+      const size = await fileSize(null, abs);
+      if (size == null) throw new Error(`找不到文件：${p}`);
+      const body = await readFile(null, abs, size);
+      this.emit({ t: 'file', name: path.basename(abs), path: abs, req: p, host: null, size, line, ...body });
+    } catch (e) {
+      this.emit({ t: 'file', error: e.message, name: path.posix.basename(parseRef(text).p), path: parseRef(text).p, req: parseRef(text).p });
+    }
+  }
+
   async handle(msg) {
     if (msg.t === 'windows') {
       const list = await annotateWindows();
-      const ssh = sshWorkspaces().map(w => ({
+      const ssh = CLAUDE_MODE ? [] : sshWorkspaces().map(w => ({
         host: w.host,
         root: w.root,
         name: path.posix.basename(w.root) || w.root,
@@ -1530,16 +1836,28 @@ class Session {
         list: list.map(({ id, title, kind, sshHost }) => ({ id, title, sshHost: sshHost || '', kind: sshHost ? 'ssh' : kind })),
         ssh,
         current: this.targetId,
+        hint: CLAUDE_MODE && !list.length ? '没有检测到正在运行的 Claude Code。在项目目录打开终端运行 claude，它会按所在目录出现在这里。' : '',
       });
     }
-    if (msg.t === 'openSsh') return this.openSsh(msg.host, msg.root);
-    if (msg.t === 'sshTargets') return this.sshTargets();
-    if (msg.t === 'openSshHost') return this.openSshHost(msg.host);
+    if (msg.t === 'openSsh') {
+      if (CLAUDE_MODE) throw new Error('Claude 模式不支持打开 Cursor SSH 窗口');
+      return this.openSsh(msg.host, msg.root);
+    }
+    if (msg.t === 'sshTargets') {
+      if (CLAUDE_MODE) return this.emit({ t: 'sshTargets', hosts: [] });
+      return this.sshTargets();
+    }
+    if (msg.t === 'openSshHost') {
+      if (CLAUDE_MODE) throw new Error('Claude 模式不支持打开 Cursor SSH 窗口');
+      return this.openSshHost(msg.host);
+    }
     if (msg.t === 'thumbs') return this.sendThumbs(msg.paths);
     if (msg.t === 'attach') return this.attach(msg.id);
     if (msg.t === 'mode') return this.setMode(msg.mode);
     if (msg.t === 'visible') { this.visible = Boolean(msg.v); return; }
     if (msg.t === 'lang') { updateDevice(this.deviceId, { lang: msg.v === 'en' ? 'en' : 'zh' }); return; }
+    if (typeof msg.t === 'string' && msg.t.startsWith('term_')) return this.handleTerminal(msg);
+    if (CLAUDE_MODE) return this.handleClaude(msg);
     if (!this.cdp) throw new Error('尚未连接到 Cursor 窗口');
     switch (msg.t) {
       case 'openMenu': return this.openMenu(msg.kind);
@@ -1562,6 +1880,18 @@ class Session {
         this.imageId = msg.id;
         try { return await this.removeImage(msg.index); }
         catch (e) { this.emit({ t: 'image', id: msg.id, ok: false, msg: e.message }); throw e; }
+      case 'ossBegin':
+        try { return await this.ossBegin(msg.id, msg.name, msg.size, msg.type); }
+        catch (e) { this.dropOssUpload(msg.id); this.emit({ t: 'oss', id: msg.id, ok: false, msg: e.message }); throw e; }
+      case 'ossChunk':
+        try { return await this.ossChunk(msg.id, Number(msg.n), msg.data); }
+        catch (e) { this.dropOssUpload(msg.id); this.emit({ t: 'oss', id: msg.id, ok: false, msg: e.message }); throw e; }
+      case 'ossEnd':
+        try { return await this.ossEnd(msg.id); }
+        catch (e) { this.emit({ t: 'oss', id: msg.id, ok: false, msg: e.message }); throw e; }
+      case 'ossDrop':
+        try { return await this.ossDrop(msg.id); }
+        catch (e) { this.emit({ t: 'oss', id: msg.id, ok: false, msg: e.message }); throw e; }
       case 'attachFile':
         this.imageId = msg.id;
         try { return await this.attachFile(msg.data, msg.name, msg.type); }
@@ -1590,11 +1920,33 @@ class Session {
     }
   }
 
+  handleTerminal(msg) {
+    if (msg.t === 'term_open') {
+      terminalViewers.add(this);
+      const started = openTerminal(msg.cols, msg.rows, msg.session);
+      // A phone that attaches to a running terminal first gets what is already on its screen.
+      if (!started) this.emit({ t: 'term', data: terminal.backlog, replay: true });
+      return;
+    }
+    if (msg.t === 'term_in') return terminal?.write(String(msg.data ?? '').slice(0, 16000));
+    if (msg.t === 'term_resize') return terminal?.resize(msg.cols, msg.rows);
+    if (msg.t === 'term_close') {
+      const old = terminal;
+      terminal = null;
+      old?.close();
+    }
+  }
+
   dispose() {
     this.sshWatch++;
     this.sshOpening = '';
+    for (const id of [...this.ossUp.keys()]) this.dropOssUpload(id);
+    for (const item of this.ossStaged.values()) ossDel(item.key).catch(() => {});
+    this.ossStaged.clear();
     clearInterval(this.idleTimer);
     clearTimeout(this.ackTimer);
+    claudeViewers.delete(this);
+    terminalViewers.delete(this);
     this.detach();
   }
 }
@@ -1743,6 +2095,7 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404, SECURITY_HEADERS).end('not found');
 });
 
+const OSS_MAX = 200 * 1024 * 1024;
 const wss = new WebSocketServer({ noServer: true, maxPayload: 14 << 20 });
 
 server.on('upgrade', (req, socket, head) => {
@@ -1775,8 +2128,9 @@ wss.on('connection', (ws, req) => {
       console.log(`[+] client ${clientIp(req)}`);
       return;
     }
-    // Frame acks bypass the queue so a slow command never stalls the stream.
+    // Frame acks and terminal keys bypass the queue so a slow command never stalls the stream or typing.
     if (msg.t === 'ack') return session.ack();
+    if (typeof msg.t === 'string' && msg.t.startsWith('term_')) return session.handleTerminal(msg);
     session.enqueue(async () => {
       try {
         const queued = await session.handle(msg);
@@ -1834,15 +2188,16 @@ function imageFileFromSrc(src) {
   } catch { return ''; }
 }
 
-// Only files Cursor itself saved for a chat attachment. Anything else is refused.
+// Cursor chat attachments, or phone uploads saved under a Claude project's temp/.
 function localChatImage(p) {
   if (typeof p !== 'string' || !p.startsWith('/')) return null;
   let real;
   try { real = fs.realpathSync(path.normalize(p)); } catch { return null; }
   const rel = path.relative(workspaceImagesRoot(), real);
-  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
-  if (!/^[^/]+\/images\/[^/]+\.(png|jpe?g|gif|webp)$/i.test(rel)) return null;
-  return real;
+  if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)
+    && /^[^/]+\/images\/[^/]+\.(png|jpe?g|gif|webp)$/i.test(rel)) return real;
+  if (CLAUDE_MODE && /\/temp\/phone-\d+-[0-9a-f]+\.(png|jpe?g|gif|webp)$/i.test(real)) return real;
+  return null;
 }
 
 const thumbCache = new Map();
@@ -1965,18 +2320,25 @@ function startTunnel() {
 }
 
 server.listen(PORT, (TUNNEL || PUBLIC_URL) ? '127.0.0.1' : HOST, async () => {
-  console.log(`Cursor Remote Lite 已启动，端口 ${PORT}`);
+  console.log(`Cursor Remote Lite 已启动，端口 ${PORT}${CLAUDE_MODE ? '（Claude CLI 后端）' : ''}`);
   console.log(`已配对 ${listDevices().length} 台设备。添加新设备：npm run pair`);
-  startWatcher({
-    listWindows,
-    openCdp: async ws => { const c = new Cdp(ws); await c.connect(); return c; },
-    probe: helpersCall('agentState()'),
-  });
-  try {
-    const wins = await listWindows();
-    console.log(`已连上 Cursor，${wins.length} 个窗口：${wins.map(w => w.title).join(' | ')}`);
-  } catch {
-    console.log(`!! 连不上 ${CDP_URL}。请用 ./start-cursor.sh（Windows: start-cursor.ps1）重新启动 Cursor（带 --remote-debugging-port=9222）`);
+  if (CLAUDE_MODE) {
+    stopRelayOwnedSessions();
+    const clients = listClaudeClients();
+    if (clients.length) console.log(`检测到 ${clients.length} 个 Claude Code：${clients.map(c => c.base).join(' | ')}`);
+    else console.log('还没有正在运行的 Claude Code。在项目目录里运行 claude 后，手机会按目录列出它们。');
+  } else {
+    startWatcher({
+      listWindows,
+      openCdp: async ws => { const c = new Cdp(ws); await c.connect(); return c; },
+      probe: helpersCall('agentState()'),
+    });
+    try {
+      const wins = await listWindows();
+      console.log(`已连上 Cursor，${wins.length} 个窗口：${wins.map(w => w.title).join(' | ')}`);
+    } catch {
+      console.log(`!! 连不上 ${CDP_URL}。请用 ./start-cursor.sh（Windows: start-cursor.ps1）重新启动 Cursor（带 --remote-debugging-port=9222）`);
+    }
   }
   if (PUBLIC_URL) {
     console.log(`公网地址：${PUBLIC_URL}`);

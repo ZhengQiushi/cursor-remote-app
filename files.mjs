@@ -144,6 +144,62 @@ function sshOnce(host, command, limit) {
   });
 }
 
+export function safeFileName(name) {
+  const base = path.basename(String(name || 'file')).replace(/[/\\]/g, '');
+  const cleaned = base.replace(/[^\w.\- ()\u4e00-\u9fff]+/g, '_').replace(/^\.+/, '').slice(0, 80);
+  return cleaned || 'file';
+}
+
+function expandHome(p) {
+  return String(p || '').replace(/^~(?=\/)/, os.homedir());
+}
+
+function uniqueLocal(dir, name) {
+  const ext = path.extname(name);
+  const stem = path.basename(name, ext);
+  let candidate = name;
+  for (let i = 2; fs.existsSync(path.join(dir, candidate)); i++) candidate = `${stem}-${i}${ext}`;
+  return path.join(dir, candidate);
+}
+
+function pipeToRemote(host, remoteFile, localFile) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('ssh', [...SSH_OPTS, host, `mkdir -p ${remotePath(path.posix.dirname(remoteFile))} && cat > ${remotePath(remoteFile)}`], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let err = '';
+    child.stderr.on('data', c => { err += c; });
+    const timer = setTimeout(() => child.kill(), 10 * 60 * 1000);
+    fs.createReadStream(localFile).pipe(child.stdin);
+    child.on('error', e => { clearTimeout(timer); reject(e); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(err.trim().split('\n').pop() || `ssh exited with ${code}`));
+    });
+  });
+}
+
+// Copy a local file into <workspace>/temp and return the workspace-relative path.
+export async function saveToWorkspaceTemp(host, root, localFile, name) {
+  if (!root) throw new Error('找不到当前项目目录，先在电脑上打开一个文件夹');
+  const safe = safeFileName(name);
+  if (!host) {
+    const dir = path.join(expandHome(root), 'temp');
+    fs.mkdirSync(dir, { recursive: true });
+    const dest = uniqueLocal(dir, safe);
+    fs.copyFileSync(localFile, dest);
+    return `temp/${path.basename(dest)}`;
+  }
+  const dir = String(root).replace(/\/$/, '') + '/temp';
+  await ssh(host, `mkdir -p ${remotePath(dir)}`, 4096);
+  const ext = path.posix.extname(safe);
+  const stem = path.posix.basename(safe, ext);
+  let destName = safe;
+  const exists = await ssh(host, `test -e ${remotePath(dir + '/' + destName)} && echo yes || true`, 16);
+  if (String(exists).includes('yes')) destName = `${stem}-${Date.now().toString(36)}${ext}`;
+  await pipeToRemote(host, `${dir}/${destName}`, localFile);
+  return `temp/${destName}`;
+}
+
 // Returns the size of a regular file, or null if it doesn't exist.
 export async function fileSize(host, p) {
   if (!host) {

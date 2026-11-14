@@ -185,6 +185,8 @@
   .sub .add { color: #73c991; }
   .sub .del { color: #f14c4c; }
   .pSec { font-size: 12px; color: #999; margin: 10px 4px 6px; }
+  .menuGroup { font-size: 12px; font-weight: 600; color: #aaa; margin: 14px 4px 6px; padding-bottom: 4px; border-bottom: 1px solid #333; }
+  .menuGroup:first-child { margin-top: 4px; }
   .pRow { display: flex; flex-wrap: wrap; gap: 6px; }
   .pRow button { padding: 8px 12px; font-size: 13.5px; }
   .pRow button.on { border-color: #1177bb; background: #0e639c; color: #fff; }
@@ -299,7 +301,7 @@
     <button id="img" title="附加图片" aria-label="附加图片"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5-9 9"/></svg></button>
     <input id="imgFile" type="file" accept="image/*" multiple hidden>
     <button id="fileBtn" title="附加文件" aria-label="附加文件"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 17.9 8.76l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
-    <input id="docFile" type="file" accept="image/*,application/pdf,.pdf" multiple hidden>
+    <input id="docFile" type="file" multiple hidden>
     <button id="mic" title="语音输入" aria-label="语音输入"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
     <button id="send">发送</button>
   </div>
@@ -365,7 +367,7 @@ let base = null, info = null, ws = null, authed = false, failures = 0;
 let mode = store.get('mode') || 'chat';
 let crop = store.get('crop') !== 'full';
 let frame = { w: 1000, h: 800 }, panel = null, zoom = 1, tapMode = 'tap', rightNext = false;
-let windows = [], sshRecent = [], currentWindow = null;
+let windows = [], sshRecent = [], currentWindow = null, windowHint = '';
 
 // Keep the layout above the on-screen keyboard.
 function fitViewport() {
@@ -757,7 +759,7 @@ function connect() {
     else if (m.t === 'chat') renderChat(m.chat);
     else if (m.t === 'frame') onFrame(m);
     else if (m.t === 'panel') { panel = m.rect; layoutStage(); applyQuality(); }
-    else if (m.t === 'windows') { windows = m.list; sshRecent = m.ssh || []; currentWindow = m.current; if (sheetKind === 'windows') showWindows(); }
+    else if (m.t === 'windows') { windows = m.list; sshRecent = m.ssh || []; currentWindow = m.current; windowHint = m.hint || ''; if (sheetKind === 'windows') showWindows(); }
     else if (m.t === 'sshTargets') { sshHosts = m.hosts || []; renderSsh(); }
     else if (m.t === 'attached') {
       store.set('window', m.id);
@@ -770,7 +772,7 @@ function connect() {
     else if (m.t === 'params') showParams(m);
     else if (m.t === 'changes') showChanges(m);
     else if (m.t === 'file') showFile(m);
-    else if (m.t === 'image' || m.t === 'attachFile') { if (m.pending) bumpImageWait(m.id); else resolveImageWait(m.id, m); }
+    else if (m.t === 'image' || m.t === 'attachFile' || m.t === 'oss') { if (m.pending) bumpImageWait(m.id); else resolveImageWait(m.id, m); }
     else if (m.t === 'thumbs') applyThumbs(m.items);
     else if (m.t === 'status') status(m.msg, m.ok);
   };
@@ -806,7 +808,7 @@ function ask(question, ok = '确定') {
 // Buttons on Cursor's own cards that stop, reject or discard work.
 const RISKY = /^(stop|reject|deny|undo|discard|revert|cancel|delete|remove|停止|拒绝|撤销|丢弃|取消|删除)/i;
 
-const KIND_TAG = { agents: 'Agents', ssh: 'SSH', local: '本地' };
+const KIND_TAG = { agents: 'Agents', ssh: 'SSH', local: '本地', claude: 'Claude' };
 
 // Cursor titles look like "file.py — Folder [SSH: host]"; the window is identified by folder (+ host), not the open file.
 function winLabel(title, sshHost) {
@@ -858,7 +860,7 @@ function showWindows() {
   }).join('');
   const sshRows = sshRecent.map(s => `<button class="opt" data-ssh-host="${esc(s.host)}" data-ssh-root="${esc(s.root)}">
     <span class="tag">${s.open ? '重连' : '打开'}</span><span class="lbl">${esc(s.name)}<span class="sub">${esc(s.host)} · ${esc(s.root)}</span></span></button>`).join('');
-  openSheet('windows', `<h3>切换 Cursor 窗口</h3>${rows || '<div class="hint">没有找到窗口</div>'}
+  openSheet('windows', `<h3>切换窗口</h3>${rows || `<div class="hint">${esc(windowHint || '没有找到窗口')}</div>`}
     ${sshRows ? `<h3>SSH 项目</h3>${sshRows}<div class="hint">这里是电脑上 Cursor 最近打开过的 SSH 目录。没开窗口时会新开一个；断线时会重新连接。第一次连接可能要等一会儿，主机指纹或密码仍要在电脑上确认。</div>` : ''}`);
 }
 $('title').onclick = () => { send({ t: 'windows' }); showWindows(); };
@@ -869,10 +871,29 @@ function showMenu(kind, items, max) {
   status('');
   const maxRow = typeof max === 'boolean'
     ? `<button class="opt" data-max><span class="lbl">MAX Mode<span class="sub">更大上下文、更贵</span></span><span class="switch ${max ? 'on' : ''}"></span></button>` : '';
-  openSheet('menu', `<h3>${MENU_TITLE[kind] || ''}</h3>` + maxRow + items.map(it => {
-    const pick = `<button class="opt ${it.checked ? 'cur' : ''}" data-kind="${kind}" data-label="${esc(it.label)}"><span class="lbl">${esc(it.label)}</span></button>`;
-    return it.params ? `<div class="optRow">${pick}<button class="paramBtn" data-params="${esc(it.id)}" data-plabel="${esc(it.label)}">参数</button></div>` : pick;
-  }).join(''));
+  const hasGroups = items.some(it => it.group);
+  let body = '';
+  if (hasGroups) {
+    const groups = new Map();
+    for (const it of items) {
+      const g = it.group || 'Other';
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(it);
+    }
+    for (const [g, list] of groups) {
+      body += `<div class="menuGroup">${esc(g)}</div>`;
+      body += list.map(it => {
+        const pick = `<button class="opt ${it.checked ? 'cur' : ''}" data-kind="${kind}" data-label="${esc(it.label)}"><span class="lbl">${esc(it.label)}</span></button>`;
+        return it.params ? `<div class="optRow">${pick}<button class="paramBtn" data-params="${esc(it.id)}" data-plabel="${esc(it.label)}">参数</button></div>` : pick;
+      }).join('');
+    }
+  } else {
+    body = items.map(it => {
+      const pick = `<button class="opt ${it.checked ? 'cur' : ''}" data-kind="${kind}" data-label="${esc(it.label)}"><span class="lbl">${esc(it.label)}</span></button>`;
+      return it.params ? `<div class="optRow">${pick}<button class="paramBtn" data-params="${esc(it.id)}" data-plabel="${esc(it.label)}">参数</button></div>` : pick;
+    }).join('');
+  }
+  openSheet('menu', `<h3>${MENU_TITLE[kind] || ''}</h3>` + maxRow + body);
 }
 
 function showChanges(m) {
@@ -1855,15 +1876,15 @@ function addImageCard(file) {
   syncImageStrip();
   return item;
 }
-function addFileCard(file) {
-  const id = 'img' + (++imageSeq);
+function addFileCard(file, kind = 'file', id = '') {
+  id = id || ('img' + (++imageSeq));
   const card = document.createElement('div');
   card.className = 'imgCard file';
   const ext = (String(file.name || 'file').split('.').pop() || 'FILE').slice(0, 4).toUpperCase();
   card.innerHTML = `<div class="fileBody"><b>${esc(ext)}</b><span>${esc(file.name || 'file')}</span></div>${cardChrome(id, '移除文件')}`;
   setCardProgress(card, 0.04);
   $('imgStrip').append(card);
-  const item = { id, url: '', card, index: null, pillId: '', state: 'uploading', kind: 'file' };
+  const item = { id, url: '', card, index: null, pillId: '', state: 'uploading', kind };
   imageCards.push(item);
   syncImageStrip();
   return item;
@@ -1879,7 +1900,8 @@ function failImageCard(item) {
   item.card.querySelector('.ring').hidden = true;
   item.card.querySelector('.x').hidden = false;
 }
-function dropImageCard(item) {
+function dropImageCard(item, silent = false) {
+  if (!silent && item.kind === 'oss') send({ t: 'ossDrop', id: item.id });
   if (item.url) URL.revokeObjectURL(item.url);
   item.card.remove();
   const at = imageCards.indexOf(item);
@@ -1887,7 +1909,7 @@ function dropImageCard(item) {
   syncImageStrip();
 }
 function clearImageCards() {
-  for (const item of [...imageCards]) dropImageCard(item);
+  for (const item of [...imageCards]) dropImageCard(item, true);
 }
 const readDataUrl = file => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
 
@@ -1914,9 +1936,11 @@ $('imgStrip').onclick = async e => {
   dropImageCard(item);
   status('');
 };
-const FILE_LIMIT = 8 * 1024 * 1024;
+const OSS_MIN = 5 * 1024 * 1024;
+const OSS_MAX = 200 * 1024 * 1024;
 const isImageFile = f => /^image\//.test(f.type) || /\.(png|jpe?g|gif|webp|heic|heif|bmp)$/i.test(f.name || '');
 const isPdfFile = f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name || '');
+const wantsOss = f => !isImageFile(f) && !(isPdfFile(f) && f.size <= OSS_MIN);
 let sharedWait = [];
 function flushShared() {
   if (!sharedWait.length || !authed) return;
@@ -1943,16 +1967,99 @@ window.takeShared = raw => {
   }
   uploadPicked(files);
 };
+async function ossStep(id, payload, timeout) {
+  const ack = waitImage(id, timeout, '上传超时，请再试一次');
+  send(payload);
+  const result = await ack;
+  if (!result.ok) throw new Error(result.msg || '上传失败');
+  return result;
+}
+async function uploadOss(item, file) {
+  if (file.size > OSS_MAX) throw new Error('文件太大，请换一个小一些的（上限 200 MB）');
+  await ossStep(item.id, { t: 'ossBegin', id: item.id, name: file.name, size: file.size, type: file.type || '' }, 30000);
+  const chunkSize = 1536 * 1024;
+  let sent = 0;
+  for (let n = 0; sent < file.size; n++) {
+    const blob = file.slice(sent, Math.min(file.size, sent + chunkSize));
+    const url = await readDataUrl(blob);
+    setCardProgress(item.card, file.size ? sent / file.size * 0.9 : 0.5);
+    await ossStep(item.id, { t: 'ossChunk', id: item.id, n, data: url.slice(url.indexOf(',') + 1) }, 60000);
+    sent += blob.size;
+  }
+  await ossStep(item.id, { t: 'ossEnd', id: item.id }, 600000);
+  setCardProgress(item.card, 1);
+  finishImageCard(item);
+  status('已上传，发送后会放到 temp/' + (file.name || 'file'));
+}
+const shareJobs = new Map();
+const ackShare = () => { try { window.CursorRemoteApp?.shareAck?.(); } catch {} };
+function decodeB64(data) {
+  const bin = atob(data || '');
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+// The Android shell streams a shared file so a large WeChat / WPS file is not one giant string.
+window.shareOpen = raw => {
+  let meta = null;
+  try { meta = JSON.parse(raw); } catch {}
+  if (!meta?.id) { ackShare(); return; }
+  const file = { name: meta.name || 'file', type: meta.type || '', size: Number(meta.size) || 0 };
+  const job = { id: meta.id, name: file.name, type: file.type, size: file.size, n: 0, got: 0, parts: [], item: null, failed: null, chain: Promise.resolve() };
+  job.mode = !isImageFile(file) && (wantsOss(file) || file.size > OSS_MIN) ? 'oss' : 'buffer';
+  if (job.mode === 'oss') job.item = addFileCard(file, 'oss', meta.id);
+  shareJobs.set(meta.id, job);
+  job.chain = job.chain.then(async () => {
+    if (job.mode !== 'oss') return;
+    if (file.size > OSS_MAX) throw new Error('文件太大，请换一个小一些的（上限 200 MB）');
+    await ossStep(job.item.id, { t: 'ossBegin', id: job.item.id, name: file.name, size: file.size, type: file.type }, 30000);
+  }).then(ackShare, err => { job.failed = err; ackShare(); });
+};
+window.shareChunk = (id, b64) => {
+  const job = shareJobs.get(id);
+  if (!job) { ackShare(); return; }
+  job.chain = job.chain.then(async () => {
+    if (job.failed) return;
+    if (job.mode === 'oss') {
+      await ossStep(job.item.id, { t: 'ossChunk', id: job.item.id, n: job.n, data: b64 }, 60000);
+      job.n++;
+      job.got += Math.floor(String(b64 || '').length * 3 / 4);
+      if (job.size) setCardProgress(job.item.card, Math.min(0.9, job.got / job.size));
+    } else job.parts.push(b64);
+  }).then(ackShare, err => { job.failed = err; ackShare(); });
+};
+window.shareClose = id => {
+  const job = shareJobs.get(id);
+  if (!job) { ackShare(); return; }
+  job.chain = job.chain.then(async () => {
+    if (job.failed) throw job.failed;
+    if (job.mode === 'oss') {
+      await ossStep(job.item.id, { t: 'ossEnd', id: job.item.id }, 600000);
+      setCardProgress(job.item.card, 1);
+      finishImageCard(job.item);
+      status('已上传，发送后会放到 temp/' + job.name);
+      return;
+    }
+    const file = new File(job.parts.map(decodeB64), job.name, { type: job.type });
+    await uploadPicked([file]);
+  }).then(() => { shareJobs.delete(id); ackShare(); }, err => {
+    if (job.item) failImageCard(job.item);
+    status(err.message || '读不了这个文件，换一个试试', false);
+    shareJobs.delete(id);
+    ackShare();
+  });
+};
 async function uploadPicked(files) {
   if (!files.length) return;
   if (!ws || ws.readyState !== 1 || !authed) return status('未连接', false);
   for (const file of files) {
-    const kind = isPdfFile(file) ? 'file' : isImageFile(file) ? 'image' : '';
+    const kind = wantsOss(file) ? 'oss' : isPdfFile(file) ? 'file' : isImageFile(file) ? 'image' : '';
     if (!kind) { status('目前只能附加图片和 PDF', false); continue; }
-    if (kind === 'file' && file.size > FILE_LIMIT) { status('文件太大，请换一个小一些的（上限 8 MB）', false); continue; }
-    const item = kind === 'file' ? addFileCard(file) : addImageCard(file);
+    if (kind === 'oss' && file.size > OSS_MAX) { status('文件太大，请换一个小一些的（上限 200 MB）', false); continue; }
+    const item = kind === 'image' ? addImageCard(file) : addFileCard(file, kind);
     let creep = null;
     try {
+      if (kind === 'oss') { await uploadOss(item, file); continue; }
       let payload = file;
       if (kind === 'image') payload = await shrinkImage(file, p => setCardProgress(item.card, p));
       else setCardProgress(item.card, 0.35);
@@ -1977,7 +2084,8 @@ async function uploadPicked(files) {
       finishImageCard(item);
     } catch (e) {
       failImageCard(item);
-      const fallback = kind === 'file' ? '读不了这个文件，换一个试试' : '读不了这张图片，换一张试试';
+      if (kind === 'oss') send({ t: 'ossDrop', id: item.id });
+      const fallback = kind === 'image' ? '读不了这张图片，换一张试试' : '读不了这个文件，换一个试试';
       status(e.message && e.message !== 'encode' ? e.message : fallback, false);
     } finally {
       clearInterval(creep);

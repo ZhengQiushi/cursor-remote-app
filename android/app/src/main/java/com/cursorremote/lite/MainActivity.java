@@ -35,6 +35,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 
 // A thin WebView shell around the user's GitHub Pages app, so it installs without Google Play services or PWA support.
 public class MainActivity extends Activity {
@@ -43,7 +44,11 @@ public class MainActivity extends Activity {
     private static final String UPDATE_FILE = "CursorRemote-update.apk";
     private static final int VOICE = 7;
     private static final int PICK = 8;
-    private static final int SHARE_LIMIT = 8 * 1024 * 1024;
+    private static final int SHARE_LIMIT = 200 * 1024 * 1024;
+    private static final int DIRECT_LIMIT = 5 * 1024 * 1024;
+    private static final int SHARE_CHUNK = 512 * 1024;
+    private final Object shareLock = new Object();
+    private boolean shareAck;
     private WebView web;
     private ValueCallback<Uri[]> pickFile;
     private SharedPreferences prefs;
@@ -210,7 +215,9 @@ public class MainActivity extends Activity {
             JSONArray arr = new JSONArray();
             for (Uri uri : uris) {
                 try {
-                    arr.put(readShared(uri, fallback));
+                    long size = sharedSize(uri);
+                    if (size < 0 || size > DIRECT_LIMIT) streamShared(uri, fallback);
+                    else arr.put(readShared(uri, fallback));
                 } catch (Exception e) {
                     JSONObject err = new JSONObject();
                     try {
@@ -219,12 +226,75 @@ public class MainActivity extends Activity {
                     } catch (Exception ignored) {}
                 }
             }
+            if (arr.length() == 0) return;
             String json = arr.toString();
             runOnUiThread(() -> {
                 pendingShare = json;
                 deliverShare();
             });
         }).start();
+    }
+
+    private long sharedSize(Uri uri) {
+        try (Cursor c = getContentResolver().query(uri, new String[]{OpenableColumns.SIZE}, null, null, null)) {
+            if (c != null && c.moveToFirst() && !c.isNull(0)) return c.getLong(0);
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
+    // Files over 5 MB are handed to the page one chunk at a time. The page uploads them to OSS.
+    private void streamShared(Uri uri, String fallbackType) throws Exception {
+        String name = "file";
+        long size = -1;
+        try (Cursor c = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                if (!c.isNull(0)) name = c.getString(0);
+                if (!c.isNull(1)) size = c.getLong(1);
+            }
+        }
+        if (size > SHARE_LIMIT) throw new IllegalStateException("文件太大，请换一个小一些的（上限 200 MB）");
+        String type = getContentResolver().getType(uri);
+        if (type == null || type.isEmpty()) type = fallbackType == null ? "" : fallbackType;
+        String id = "sh" + System.nanoTime();
+        JSONObject meta = new JSONObject();
+        meta.put("id", id);
+        meta.put("name", name);
+        meta.put("type", type);
+        meta.put("size", Math.max(size, 0));
+        if (!evalShare("window.shareOpen && shareOpen(" + JSONObject.quote(meta.toString()) + ")", 30000)) {
+            throw new IllegalStateException("上传超时，请再试一次");
+        }
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) throw new IllegalStateException("读不了这个文件，换一个试试");
+            byte[] buf = new byte[SHARE_CHUNK];
+            int n;
+            long total = 0;
+            while ((n = in.read(buf)) >= 0) {
+                if (n == 0) continue;
+                total += n;
+                if (total > SHARE_LIMIT) throw new IllegalStateException("文件太大，请换一个小一些的（上限 200 MB）");
+                String b64 = Base64.encodeToString(n == buf.length ? buf : Arrays.copyOf(buf, n), Base64.NO_WRAP);
+                String js = "window.shareChunk && shareChunk(" + JSONObject.quote(id) + "," + JSONObject.quote(b64) + ")";
+                if (!evalShare(js, 60000)) throw new IllegalStateException("上传超时，请再试一次");
+            }
+        }
+        if (!evalShare("window.shareClose && shareClose(" + JSONObject.quote(id) + ")", 600000)) {
+            throw new IllegalStateException("上传超时，请再试一次");
+        }
+    }
+
+    private boolean evalShare(String js, long waitMs) {
+        synchronized (shareLock) { shareAck = false; }
+        runOnUiThread(() -> web.evaluateJavascript(js, null));
+        synchronized (shareLock) {
+            long end = System.currentTimeMillis() + waitMs;
+            while (!shareAck) {
+                long left = end - System.currentTimeMillis();
+                if (left <= 0) return false;
+                try { shareLock.wait(left); } catch (InterruptedException e) { return false; }
+            }
+            return true;
+        }
     }
 
     private JSONObject readShared(Uri uri, String fallbackType) throws Exception {
@@ -236,7 +306,7 @@ public class MainActivity extends Activity {
                 if (!c.isNull(1)) size = c.getLong(1);
             }
         }
-        if (size > SHARE_LIMIT) throw new IllegalStateException("文件太大，请换一个小一些的（上限 8 MB）");
+        if (size > SHARE_LIMIT) throw new IllegalStateException("文件太大，请换一个小一些的（上限 200 MB）");
         ByteArrayOutputStream out = new ByteArrayOutputStream(size > 0 && size <= SHARE_LIMIT ? (int) size : 8192);
         try (InputStream in = getContentResolver().openInputStream(uri)) {
             if (in == null) throw new IllegalStateException("读不了这个文件，换一个试试");
@@ -245,7 +315,7 @@ public class MainActivity extends Activity {
             long total = 0;
             while ((n = in.read(buf)) >= 0) {
                 total += n;
-                if (total > SHARE_LIMIT) throw new IllegalStateException("文件太大，请换一个小一些的（上限 8 MB）");
+                if (total > SHARE_LIMIT) throw new IllegalStateException("文件太大，请换一个小一些的（上限 200 MB）");
                 out.write(buf, 0, n);
             }
         }
@@ -410,6 +480,14 @@ public class MainActivity extends Activity {
                 try { startActivityForResult(i, VOICE); } catch (Exception e) { voiceResult(""); }
             });
             return true;
+        }
+
+        @JavascriptInterface
+        public void shareAck() {
+            synchronized (shareLock) {
+                shareAck = true;
+                shareLock.notifyAll();
+            }
         }
 
         @JavascriptInterface

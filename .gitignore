@@ -7,3 +7,4 @@ android/app/build/
 android/local.properties
 *.p12
 *.jks
+/temp/
