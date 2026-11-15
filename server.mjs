@@ -111,48 +111,36 @@ function originAllowed(req) {
 
 const claudeViewers = new Set();
 
-// The terminal tab: one Claude Code per conversation on this computer. A terminal keeps running when the
-// phone leaves the tab, switches conversation or disconnects; it ends only when closed or when its program exits.
+// The terminal tab: one Claude Code (or CLAUDE_BIN) on this computer, shared by the phones that open
+// the tab. It keeps running when a phone disconnects, so the conversation is still there on return.
 const terminalViewers = new Set();
-const MAX_TERMINALS = 4;
-const terminals = new Map(); // conversation id -> TerminalProcess ('' for a new conversation)
 const TERM_FILE_MAX_B64 = 11_000_000; // about 8 MB of file; the socket accepts 14 MB
 const TERMINAL_BIN = whichClaude(process.env.CLAUDE_BIN || '');
+let terminal = null;
 
 // Session ids are UUIDs (Claude Code); anything else is refused so it cannot reach the command line.
 const SESSION_ID = /^[0-9a-f-]{36}$/i;
 
-function terminalFor(key) {
-  const term = terminals.get(key);
-  return term?.alive ? term : null;
-}
-
-// Returns the terminal for a conversation, starting it if needed. `started` is false when one was already running.
-function openTerminal(key, cols, rows) {
-  const running = terminalFor(key);
-  if (running) {
-    running.resize(cols, rows);
-    return { term: running, started: false };
+function openTerminal(cols, rows, session) {
+  const want = SESSION_ID.test(session || '') ? session : '';
+  if (terminal?.alive && terminal.session === want) {
+    terminal.resize(cols, rows);
+    return false;
   }
-  const live = [...terminals.values()].filter(t => t.alive).length;
-  if (live >= MAX_TERMINALS) throw new Error(`最多同时运行 ${MAX_TERMINALS} 个终端，先在电脑上或手机上结束一个`);
+  // Another conversation is open here: end it first, so the phone gets the one it asked for.
+  if (terminal?.alive) terminal.close();
+  // A terminal that was closed on purpose (restart) must not speak for its successor.
   const term = new TerminalProcess({
-    argv: key ? [TERMINAL_BIN, '--resume', key] : [TERMINAL_BIN],
-    session: key,
+    argv: want ? [TERMINAL_BIN, '--resume', want] : [TERMINAL_BIN],
+    session: want,
     cwd: CLAUDE_CWD,
     cols,
     rows,
-    onData: data => {
-      if (terminals.get(key) !== term) return;
-      for (const v of terminalViewers) if (v.termKey === key && v.mode === 'term') v.emit({ t: 'term', data });
-    },
-    onExit: code => {
-      if (terminals.get(key) !== term) return;
-      for (const v of terminalViewers) if (v.termKey === key) v.emit({ t: 'term_exit', code });
-    },
+    onData: data => { if (terminal === term) for (const v of terminalViewers) v.emit({ t: 'term', data }); },
+    onExit: code => { if (terminal === term) for (const v of terminalViewers) v.emit({ t: 'term_exit', code }); },
   });
-  terminals.set(key, term);
-  return { term, started: true };
+  terminal = term;
+  return true;
 }
 
 async function listWindows() {
@@ -1936,24 +1924,16 @@ class Session {
   handleTerminal(msg) {
     if (msg.t === 'term_open') {
       terminalViewers.add(this);
-      const key = SESSION_ID.test(msg.session || '') ? msg.session : '';
-      this.termKey = key;
-      this.mode = 'term'; // the stream follows the tab, even before the mode message is handled
-      let opened;
-      try {
-        opened = openTerminal(key, msg.cols, msg.rows);
-      } catch (e) {
-        return this.emit({ t: 'status', ok: false, msg: e.message });
-      }
+      const started = openTerminal(msg.cols, msg.rows, msg.session);
       // A phone that attaches to a running terminal first gets what is already on its screen.
-      if (!opened.started) this.emit({ t: 'term', data: opened.term.backlog, replay: true });
+      if (!started) this.emit({ t: 'term', data: terminal.backlog, replay: true });
       return;
     }
-    if (msg.t === 'term_in') return terminalFor(this.termKey)?.write(String(msg.data ?? '').slice(0, 16000));
-    if (msg.t === 'term_resize') return terminalFor(this.termKey)?.resize(msg.cols, msg.rows);
+    if (msg.t === 'term_in') return terminal?.write(String(msg.data ?? '').slice(0, 16000));
+    if (msg.t === 'term_resize') return terminal?.resize(msg.cols, msg.rows);
     if (msg.t === 'term_close') {
-      const old = terminals.get(this.termKey);
-      terminals.delete(this.termKey);
+      const old = terminal;
+      terminal = null;
       old?.close();
       return;
     }
@@ -1969,7 +1949,7 @@ class Session {
       const data = typeof msg.data === 'string' ? msg.data : '';
       if (!/^[A-Za-z0-9+/=]+$/.test(data) || !data.length) throw new Error('文件内容无效');
       if (data.length > TERM_FILE_MAX_B64) throw new Error('文件太大，终端上传上限 8 MB');
-      if (!terminalFor(this.termKey)) throw new Error('终端没有在运行');
+      if (!terminal?.alive) throw new Error('终端没有在运行');
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-remote-term-'));
       tmp = path.join(dir, 'upload');
       fs.writeFileSync(tmp, Buffer.from(data, 'base64'));
