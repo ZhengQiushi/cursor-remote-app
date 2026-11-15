@@ -294,8 +294,8 @@
       <button id="termMode">模式</button>
       <img id="termPreview" alt="" hidden>
     </div>
-    <input id="termPicInput" type="file" accept="image/*" hidden>
-    <input id="termFileInput" type="file" hidden>
+    <input id="termPicInput" type="file" accept="image/*" style="position:fixed;left:-9999px;width:1px;height:1px;opacity:0">
+    <input id="termFileInput" type="file" style="position:fixed;left:-9999px;width:1px;height:1px;opacity:0">
     <form id="termForm" autocomplete="off">
       <input id="termInput" placeholder="输入文字，发送后自动回车" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false">
       <button type="submit">发送</button>
@@ -1275,7 +1275,7 @@ function termAttach() {
     termScreen.reset();
     termOpen = true;
     termSize = termScreen.cols + 'x' + termScreen.rows;
-    $('termState').textContent = '连接中…';
+    termSetState('连接中…');
     // The conversation the phone is on (the chat's); the terminal resumes it so its history shows.
     send({ t: 'term_open', cols: termScreen.cols, rows: termScreen.rows, session: store.get('window') || '' });
   });
@@ -1284,18 +1284,18 @@ function termAttach() {
 function termWrite(m) {
   if (!termScreen) return;
   if (m.replay) termScreen.reset();
-  $('termState').textContent = '运行中';
+  termSetState('运行中');
   termScreen.write(m.data || '');
 }
 
 function termEnded(code) {
   termOpen = false;
-  $('termState').textContent = `已结束（退出码 ${code}）`;
+  termSetState(`已结束（退出码 ${code}）`);
   if (termScreen) termScreen.write(`\r\n\x1b[90m[终端已结束，点「重新开始」]\x1b[0m\r\n`);
 }
 
 function termKey(name) {
-  if (!termOpen) return status('终端没有在运行', false);
+  if (!termOpen) return termNote('终端没有在运行', false);
   send({ t: 'term_in', data: TERM_KEYS[name] });
 }
 
@@ -1307,7 +1307,7 @@ $('termKeys').onclick = e => {
 // Typed text goes out first, then Enter as its own keystroke, so the program does not read them as one paste.
 $('termForm').onsubmit = e => {
   e.preventDefault();
-  if (!termOpen) return status('终端没有在运行', false);
+  if (!termOpen) return termNote('终端没有在运行', false);
   const input = $('termInput');
   const text = input.value;
   input.value = '';
@@ -1321,7 +1321,21 @@ const TERM_UPLOAD_MAX = 8 * 1024 * 1024;
 let termUploadSeq = 0;
 const termUploads = new Map();
 
+// Feedback for this tab goes on its state line; the chat's status line is hidden here.
+let termLastState = '未连接', termNoteTimer = 0;
+function termSetState(text) {
+  termLastState = text;
+  $('termState').textContent = text;
+}
+function termNote(text, ok = true) {
+  const el = $('termState');
+  el.textContent = text;
+  el.style.color = ok ? '#9cdcfe' : '#f77';
+  clearTimeout(termNoteTimer);
+  termNoteTimer = setTimeout(() => { el.textContent = termLastState; el.style.color = ''; }, 3000);
+}
 function termPickFile(input) {
+  if (!termOpen) return termNote('终端没有在运行', false);
   input.value = '';
   input.onchange = () => {
     const file = input.files && input.files[0];
@@ -1334,26 +1348,26 @@ $('termPic').onclick = () => termPickFile($('termPicInput'));
 $('termFile').onclick = () => termPickFile($('termFileInput'));
 
 function termUpload(file) {
-  if (!termOpen) return status('终端没有在运行', false);
-  if (file.size > TERM_UPLOAD_MAX) return status('文件太大，终端上传上限 8 MB', false);
+  if (!termOpen) return termNote('终端没有在运行', false);
+  if (file.size > TERM_UPLOAD_MAX) return termNote('文件太大，终端上传上限 8 MB', false);
   const reader = new FileReader();
   reader.onload = () => {
     const id = ++termUploadSeq;
     termUploads.set(id, { file, url: file.type.startsWith('image/') ? URL.createObjectURL(file) : '' });
     const data = String(reader.result).split(',')[1] || '';
     send({ t: 'term_file', id, name: file.name, data });
-    status('正在上传…');
+    termNote('正在上传…');
   };
-  reader.onerror = () => status('读取文件失败', false);
+  reader.onerror = () => termNote('读取文件失败', false);
   reader.readAsDataURL(file);
 }
 
 function termFileDone(m) {
   const item = termUploads.get(m.id);
   termUploads.delete(m.id);
-  if (!m.ok) return status(m.error || '上传失败', false);
+  if (!m.ok) return termNote(m.error || '上传失败', false);
   if (termOpen) send({ t: 'term_in', data: m.path + ' ' });
-  status('已放入终端输入框');
+  termNote('已放入终端输入框');
   if (item?.url) {
     const img = $('termPreview');
     if (img.dataset.url) URL.revokeObjectURL(img.dataset.url);
@@ -1369,7 +1383,7 @@ $('termHistory').onclick = () => termKeyText('/resume\r');
 $('termModel').onclick = () => termKeyText('/model\r');
 $('termMode').onclick = () => termKeyText('\x1b[Z');
 function termKeyText(data) {
-  if (!termOpen) return status('终端没有在运行', false);
+  if (!termOpen) return termNote('终端没有在运行', false);
   send({ t: 'term_in', data });
 }
 
