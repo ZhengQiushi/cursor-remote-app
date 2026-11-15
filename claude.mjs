@@ -173,6 +173,27 @@ function projectDirKey(cwd) {
   return cwd.replace(/^\//, '').replace(/[\\/]/g, '-');
 }
 
+// The conversation's topic: its first thing the person asked, read from the start of its transcript.
+// Claude Code's own derived name (ai-tutor-web-96) is only a counter and says nothing about the work.
+export function topicOf(file) {
+  try {
+    const head = fs.readFileSync(file, 'utf8').split('\n').slice(0, 40);
+    for (const line of head) {
+      try {
+        const row = JSON.parse(line);
+        const text = row?.message?.content
+          || row?.content
+          || (Array.isArray(row?.message?.content) ? row.message.content.find(c => c.type === 'text')?.text : null);
+        if (typeof text === 'string' && text.trim()) return text.trim().replace(/\s+/g, ' ').slice(0, 60);
+        if (row?.type === 'user' && typeof row?.message?.content === 'string') {
+          return row.message.content.trim().replace(/\s+/g, ' ').slice(0, 60);
+        }
+      } catch {}
+    }
+  } catch {}
+  return '';
+}
+
 function listSessionFiles(cwd) {
   const dir = path.join(os.homedir(), '.claude/projects', projectDirKey(cwd));
   if (!fs.existsSync(dir)) return [];
@@ -183,26 +204,7 @@ function listSessionFiles(cwd) {
       let st;
       try { st = fs.statSync(full); } catch { return null; }
       const id = n.replace(/\.jsonl$/, '');
-      let title = id.slice(0, 8);
-      try {
-        const head = fs.readFileSync(full, 'utf8').split('\n').slice(0, 40);
-        for (const line of head) {
-          try {
-            const row = JSON.parse(line);
-            const text = row?.message?.content
-              || row?.content
-              || (Array.isArray(row?.message?.content) ? row.message.content.find(c => c.type === 'text')?.text : null);
-            if (typeof text === 'string' && text.trim()) {
-              title = text.trim().replace(/\s+/g, ' ').slice(0, 60);
-              break;
-            }
-            if (row?.type === 'user' && typeof row?.message?.content === 'string') {
-              title = row.message.content.trim().replace(/\s+/g, ' ').slice(0, 60);
-              break;
-            }
-          } catch {}
-        }
-      } catch {}
+      const title = topicOf(full) || id.slice(0, 8);
       return { id, title, mtime: st.mtimeMs };
     })
     .filter(Boolean)
@@ -999,12 +1001,13 @@ export function listClaudeClients() {
     if (meta.messagingSocketPath && !fs.existsSync(meta.messagingSocketPath)) continue;
     const cwd = meta.cwd || '';
     const base = path.basename(cwd) || meta.name || `claude-${meta.pid}`;
+    const topic = topicOf(transcriptPath(cwd, meta.sessionId));
     rows.push({
       id: meta.sessionId,
       pid: meta.pid,
       cwd,
       base,
-      name: meta.name || base,
+      name: topic || (meta.nameSource === 'derived' ? '' : meta.name) || base,
       status: meta.status || 'idle',
       waitingFor: meta.waitingFor || '',
       socket: meta.messagingSocketPath || '',

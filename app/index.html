@@ -1284,7 +1284,7 @@ function termAttach() {
     termScreen.reset();
     termOpen = true;
     termSize = termScreen.cols + 'x' + termScreen.rows;
-    $('termState').textContent = '连接中…';
+    termSetState('连接中…');
     // The conversation the phone is on (the chat's); the terminal resumes it so its history shows.
     send({ t: 'term_open', cols: termScreen.cols, rows: termScreen.rows, session: store.get('window') || '' });
   });
@@ -1293,18 +1293,18 @@ function termAttach() {
 function termWrite(m) {
   if (!termScreen) return;
   if (m.replay) termScreen.reset();
-  $('termState').textContent = '运行中';
+  termSetState('运行中');
   termScreen.write(m.data || '');
 }
 
 function termEnded(code) {
   termOpen = false;
-  $('termState').textContent = `已结束（退出码 ${code}）`;
+  termSetState(`已结束（退出码 ${code}）`);
   if (termScreen) termScreen.write(`\r\n\x1b[90m[终端已结束，点「重新开始」]\x1b[0m\r\n`);
 }
 
 function termKey(name) {
-  if (!termOpen) return status('终端没有在运行', false);
+  if (!termOpen) return termNote('终端没有在运行', false);
   send({ t: 'term_in', data: TERM_KEYS[name] });
 }
 
@@ -1319,20 +1319,50 @@ const TERM_UPLOAD_MAX = 8 * 1024 * 1024;
 let termUploadSeq = 0;
 const termCardList = []; // { id, url, path, state: 'busy'|'done'|'failed', isImage }
 
-function termPickFile(input) {
-  input.value = '';
-  input.onchange = () => {
-    const files = [...(input.files || [])];
-    for (const file of files) termUpload(file);
-  };
+// The terminal's own file pickers, made here rather than in the markup: the chat's pickers belong to the
+// chat composer, which is hidden on this tab. Off-screen rather than display:none, which some phone browsers
+// refuse to open from a script.
+const termInputs = {};
+function termPickFile(kind) {
+  if (!termOpen) return termNote('终端没有在运行', false);
+  let input = termInputs[kind];
+  if (!input) {
+    input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    if (kind === 'pic') input.accept = 'image/*';
+    input.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;opacity:0';
+    input.onchange = () => {
+      const files = [...(input.files || [])];
+      input.value = '';
+      for (const file of files) termUpload(file);
+    };
+    document.body.appendChild(input);
+    termInputs[kind] = input;
+  }
   input.click();
 }
-$('termPic').onclick = () => termPickFile($('termPicInput'));
-$('termFile').onclick = () => termPickFile($('termFileInput'));
+$('termPic').onclick = () => termPickFile('pic');
+$('termFile').onclick = () => termPickFile('file');
+
+// Feedback for this tab goes on its state line; the chat's status line is hidden here.
+let termLastState = '未连接', termNoteTimer = 0;
+function termSetState(text) {
+  termLastState = text;
+  termSetState(text);
+  $('termState').style.color = '';
+}
+function termNote(text, ok = true) {
+  const el = $('termState');
+  el.textContent = text;
+  el.style.color = ok ? '#9cdcfe' : '#f77';
+  clearTimeout(termNoteTimer);
+  termNoteTimer = setTimeout(() => { el.textContent = termLastState; el.style.color = ''; }, 3000);
+}
 
 function termUpload(file) {
-  if (!termOpen) return status('终端没有在运行', false);
-  if (file.size > TERM_UPLOAD_MAX) return status('文件太大，上限 8 MB', false);
+  if (!termOpen) return termNote('终端没有在运行', false);
+  if (file.size > TERM_UPLOAD_MAX) return termNote('文件太大，上限 8 MB', false);
   const isImage = file.type.startsWith('image/');
   const card = { id: ++termUploadSeq, url: isImage ? URL.createObjectURL(file) : '', path: '', state: 'busy', isImage };
   termCardList.push(card);
@@ -1342,7 +1372,7 @@ function termUpload(file) {
     const data = String(reader.result).split(',')[1] || '';
     send({ t: 'term_file', id: card.id, name: file.name, data });
   };
-  reader.onerror = () => { card.state = 'failed'; termRenderCards(); status('读取文件失败', false); };
+  reader.onerror = () => { card.state = 'failed'; termRenderCards(); termNote('读取文件失败', false); };
   reader.readAsDataURL(file);
 }
 
@@ -1350,7 +1380,7 @@ function termFileDone(m) {
   const card = termCardList.find(c => c.id === m.id);
   if (!card) return;
   if (m.ok) { card.state = 'done'; card.path = m.path; }
-  else { card.state = 'failed'; status(m.error || '上传失败', false); }
+  else { card.state = 'failed'; termNote(m.error || '上传失败', false); }
   termRenderCards();
 }
 
@@ -1392,10 +1422,10 @@ function termRenderCards() {
 // so the program does not read them as one paste.
 $('termForm').onsubmit = e => {
   e.preventDefault();
-  if (!termOpen) return status('终端没有在运行', false);
-  if (termCardList.some(c => c.state === 'busy')) return status('文件还在上传', false);
+  if (!termOpen) return termNote('终端没有在运行', false);
+  if (termCardList.some(c => c.state === 'busy')) return termNote('文件还在上传', false);
   const failed = termCardList.some(c => c.state === 'failed');
-  if (failed) return status('有文件上传失败，请移除后再发', false);
+  if (failed) return termNote('有文件上传失败，请移除后再发', false);
   const input = $('termInput');
   const paths = termCardList.map(c => c.path).filter(Boolean);
   const text = [...paths, input.value.trim()].filter(Boolean).join(' ');
@@ -1413,7 +1443,7 @@ $('termHistory').onclick = () => termKeyText('/resume\r');
 $('termModel').onclick = () => termKeyText('/model\r');
 $('termMode').onclick = () => termKeyText('\x1b[Z');
 function termKeyText(data) {
-  if (!termOpen) return status('终端没有在运行', false);
+  if (!termOpen) return termNote('终端没有在运行', false);
   send({ t: 'term_in', data });
 }
 
