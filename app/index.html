@@ -1295,6 +1295,7 @@ function termEnded(code) {
 }
 
 function termKey(name) {
+  if (!termLinked()) return termNote('连接断开，正在重连…', false);
   if (!termOpen) return termNote('终端没有在运行', false);
   send({ t: 'term_in', data: TERM_KEYS[name] });
 }
@@ -1307,6 +1308,7 @@ $('termKeys').onclick = e => {
 // Typed text goes out first, then Enter as its own keystroke, so the program does not read them as one paste.
 $('termForm').onsubmit = e => {
   e.preventDefault();
+  if (!termLinked()) return termNote('连接断开，正在重连…', false);
   if (!termOpen) return termNote('终端没有在运行', false);
   const input = $('termInput');
   const text = input.value;
@@ -1323,6 +1325,10 @@ const termUploads = new Map();
 
 // Feedback for this tab goes on its state line; the chat's status line is hidden here.
 let termLastState = '未连接', termNoteTimer = 0;
+// The phone's socket can drop while the tab stays open; send() then silently discards, so check first.
+function termLinked() {
+  return authed && ws && ws.readyState === 1;
+}
 function termSetState(text) {
   termLastState = text;
   $('termState').textContent = text;
@@ -1348,6 +1354,7 @@ $('termPic').onclick = () => termPickFile($('termPicInput'));
 $('termFile').onclick = () => termPickFile($('termFileInput'));
 
 function termUpload(file) {
+  if (!termLinked()) return termNote('连接断开，正在重连…', false);
   if (!termOpen) return termNote('终端没有在运行', false);
   if (file.size > TERM_UPLOAD_MAX) return termNote('文件太大，终端上传上限 8 MB', false);
   const reader = new FileReader();
@@ -1383,6 +1390,7 @@ $('termHistory').onclick = () => termKeyText('/resume\r');
 $('termModel').onclick = () => termKeyText('/model\r');
 $('termMode').onclick = () => termKeyText('\x1b[Z');
 function termKeyText(data) {
+  if (!termLinked()) return termNote('连接断开，正在重连…', false);
   if (!termOpen) return termNote('终端没有在运行', false);
   send({ t: 'term_in', data });
 }
