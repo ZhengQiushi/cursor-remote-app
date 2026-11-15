@@ -114,7 +114,7 @@ const claudeViewers = new Set();
 // The terminal tab: one Claude Code (or CLAUDE_BIN) on this computer, shared by the phones that open
 // the tab. It keeps running when a phone disconnects, so the conversation is still there on return.
 const terminalViewers = new Set();
-const TERM_FILE_MAX_B64 = 11_000_000; // about 8 MB of file; the socket accepts 14 MB
+const TERM_FILE_MAX = 8 * 1024 * 1024; // bytes; pieces are small so the socket's 14 MB limit is never near
 const TERMINAL_BIN = whichClaude(process.env.CLAUDE_BIN || '');
 let terminal = null;
 
@@ -790,6 +790,7 @@ class Session {
     this.cdp = null;
     this.claude = null;
     this.claudeImages = [];
+    this.termUploads = new Map(); // id -> an upload in progress from this phone
     this.viewport = { w: 1000, h: 800 };
     this.screencast = { format: 'jpeg', quality: 60, maxWidth: 1280, maxHeight: 2400 };
     this.awaitingAck = null;
@@ -1937,29 +1938,66 @@ class Session {
       old?.close();
       return;
     }
-    if (msg.t === 'term_file') return this.termFile(msg);
+    if (msg.t === 'term_file_begin') return this.termFileBegin(msg);
+    if (msg.t === 'term_file_chunk') return this.termFileChunk(msg);
+    if (msg.t === 'term_file_end') return this.termFileEnd(msg);
+    if (msg.t === 'term_file_cancel') return this.termFileCancel(msg.id);
   }
 
-  // A picture or file from the phone is saved into the project's temp/ folder, as the chat does,
-  // and its path is typed into the terminal so Claude Code can read it.
-  async termFile(msg) {
-    const reply = (ok, extra = {}) => this.emit({ t: 'term_file', ok, ...extra });
-    let tmp = '';
+  // A picture or file from the phone is sent in pieces; each piece is written as it arrives and acknowledged,
+  // so the phone's ring follows what has really reached the computer. When the last piece is in, the file is
+  // saved to the project's temp/ folder, as the chat does, and its path is returned.
+  termFileBegin(msg) {
+    const id = msg.id;
+    try {
+      if (!terminal?.alive) throw new Error('终端没有在运行');
+      const size = Number(msg.size);
+      if (!Number.isInteger(size) || size <= 0 || size > TERM_FILE_MAX) throw new Error('文件太大，终端上传上限 8 MB');
+      this.termFileCancel(id);
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-remote-term-'));
+      this.termUploads.set(id, { dir, file: path.join(dir, 'upload'), name: String(msg.name || 'file'), size, got: 0, next: 0 });
+    } catch (e) {
+      this.emit({ t: 'term_file', ok: false, id, error: e.message });
+    }
+  }
+
+  termFileChunk(msg) {
+    const up = this.termUploads.get(msg.id);
+    if (!up) return;
     try {
       const data = typeof msg.data === 'string' ? msg.data : '';
-      if (!/^[A-Za-z0-9+/=]+$/.test(data) || !data.length) throw new Error('文件内容无效');
-      if (data.length > TERM_FILE_MAX_B64) throw new Error('文件太大，终端上传上限 8 MB');
-      if (!terminal?.alive) throw new Error('终端没有在运行');
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-remote-term-'));
-      tmp = path.join(dir, 'upload');
-      fs.writeFileSync(tmp, Buffer.from(data, 'base64'));
-      const rel = await saveToWorkspaceTemp(null, CLAUDE_CWD, tmp, String(msg.name || 'file'));
-      reply(true, { path: rel, id: msg.id });
+      if (msg.n !== up.next || !/^[A-Za-z0-9+/=]+$/.test(data) || !data.length) throw new Error('上传已经中断，请重新选文件');
+      const buf = Buffer.from(data, 'base64');
+      if (up.got + buf.length > up.size) throw new Error('文件大小不对，请重新选文件');
+      fs.appendFileSync(up.file, buf);
+      up.got += buf.length;
+      up.next++;
+      this.emit({ t: 'term_file_ack', id: msg.id, n: msg.n, got: up.got });
     } catch (e) {
-      reply(false, { error: e.message, id: msg.id });
-    } finally {
-      if (tmp) fs.rmSync(path.dirname(tmp), { recursive: true, force: true });
+      this.termFileCancel(msg.id);
+      this.emit({ t: 'term_file', ok: false, id: msg.id, error: e.message });
     }
+  }
+
+  async termFileEnd(msg) {
+    const up = this.termUploads.get(msg.id);
+    if (!up) return;
+    try {
+      if (up.got !== up.size) throw new Error('文件没有传完，请重新选文件');
+      const rel = await saveToWorkspaceTemp(null, CLAUDE_CWD, up.file, up.name);
+      this.emit({ t: 'term_file', ok: true, id: msg.id, path: rel });
+    } catch (e) {
+      this.emit({ t: 'term_file', ok: false, id: msg.id, error: e.message });
+    } finally {
+      this.termFileCancel(msg.id);
+    }
+  }
+
+  termFileCancel(id) {
+    const up = this.termUploads.get(id);
+    if (!up) return;
+    this.termUploads.delete(id);
+    fs.rmSync(up.dir, { recursive: true, force: true });
   }
 
   dispose() {
@@ -1972,6 +2010,7 @@ class Session {
     clearTimeout(this.ackTimer);
     claudeViewers.delete(this);
     terminalViewers.delete(this);
+    for (const id of [...this.termUploads.keys()]) this.termFileCancel(id);
     this.detach();
   }
 }
