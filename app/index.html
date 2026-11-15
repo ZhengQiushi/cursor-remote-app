@@ -132,10 +132,19 @@
   #termKeys button { flex: none; }
   #termActions { border-top: 1px solid #333; }
   #termActions button { flex: none; }
-  #termPreview { flex: none; height: 30px; width: 30px; object-fit: cover; border-radius: 4px; align-self: center; cursor: pointer; }
   #termForm { flex: none; display: flex; gap: 8px; padding: 8px; background: #252526; border-top: 1px solid #333; }
   #termForm input { flex: 1; min-width: 0; font-size: 16px; padding: 9px 10px; border-radius: 8px; border: 1px solid #444; background: #1e1e1e; color: #eee; }
   #termForm button { flex: none; padding: 9px 14px; border-radius: 8px; background: #0e639c; color: #fff; border: 0; }
+  #termComposer { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+  #termCards { display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; }
+  #termCards::-webkit-scrollbar { display: none; }
+  #termCards[hidden] { display: none; }
+  .termCard { position: relative; flex: none; width: 56px; height: 56px; border-radius: 8px; overflow: hidden; background: #111; border: 1px solid #444; display: flex; align-items: center; justify-content: center; }
+  .termCard img { width: 100%; height: 100%; object-fit: cover; }
+  .termCard.busy::after { content: "…"; position: absolute; inset: 0; background: rgba(0,0,0,.5); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 20px; }
+  .termCard.file { font-size: 12px; color: #bbb; }
+  .termCard.failed { border-color: #c44; }
+  .termCard .x { position: absolute; top: 1px; right: 1px; width: 18px; height: 18px; border: 0; border-radius: 9px; background: rgba(0,0,0,.7); color: #fff; font-size: 12px; line-height: 18px; padding: 0; }
 
   /* composer */
   footer { flex: none; background: #252526; border-top: 1px solid #333; padding: 6px 10px 8px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
@@ -292,12 +301,14 @@
       <button id="termHistory">历史</button>
       <button id="termModel">模型</button>
       <button id="termMode">模式</button>
-      <img id="termPreview" alt="" hidden>
     </div>
     <input id="termPicInput" type="file" accept="image/*" style="position:fixed;left:-9999px;width:1px;height:1px;opacity:0">
     <input id="termFileInput" type="file" style="position:fixed;left:-9999px;width:1px;height:1px;opacity:0">
     <form id="termForm" autocomplete="off">
-      <input id="termInput" placeholder="输入文字，发送后自动回车" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <div id="termComposer">
+        <div id="termCards" hidden></div>
+        <input id="termInput" placeholder="输入文字，图片会一起发送" enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false">
+      </div>
       <button type="submit">发送</button>
     </form>
   </section>
@@ -1305,23 +1316,31 @@ $('termKeys').onclick = e => {
   if (b) termKey(b.dataset.tkey);
 };
 
-// Typed text goes out first, then Enter as its own keystroke, so the program does not read them as one paste.
+// Uploaded paths go in front of the typed text, as one prompt; Enter follows as its own keystroke,
+// so the program does not read them as one paste.
 $('termForm').onsubmit = e => {
   e.preventDefault();
   if (!termLinked()) return termNote('连接断开，正在重连…', false);
   if (!termOpen) return termNote('终端没有在运行', false);
+  if (termCardList.some(c => c.state === 'busy')) return termNote('文件还在上传', false);
+  if (termCardList.some(c => c.state === 'failed')) return termNote('有文件上传失败，请移除后再发', false);
   const input = $('termInput');
-  const text = input.value;
+  const paths = termCardList.map(c => c.path).filter(Boolean);
+  const text = [...paths, input.value.trim()].filter(Boolean).join(' ');
+  if (!text) return;
   input.value = '';
-  if (text) send({ t: 'term_in', data: text });
+  for (const card of termCardList) if (card.url) URL.revokeObjectURL(card.url);
+  termCardList.length = 0;
+  termRenderCards();
+  send({ t: 'term_in', data: text });
   setTimeout(() => send({ t: 'term_in', data: '\r' }), 80);
 };
 
-// Upload buttons: a picture or file is saved in the project's temp/ folder, then its path is typed
-// into the terminal (no Enter), so the person can add their words before sending.
+// Upload buttons: a picture or file is saved in the project's temp/ folder. It shows as a card above the
+// text box with its progress; its path goes in front of the text when the message is sent.
 const TERM_UPLOAD_MAX = 8 * 1024 * 1024;
 let termUploadSeq = 0;
-const termUploads = new Map();
+const termCardList = []; // { id, url, path, state: 'busy'|'done'|'failed', isImage }
 
 // Feedback for this tab goes on its state line; the chat's status line is hidden here.
 let termLastState = '未连接', termNoteTimer = 0;
@@ -1356,33 +1375,60 @@ $('termFile').onclick = () => termPickFile($('termFileInput'));
 function termUpload(file) {
   if (!termLinked()) return termNote('连接断开，正在重连…', false);
   if (!termOpen) return termNote('终端没有在运行', false);
-  if (file.size > TERM_UPLOAD_MAX) return termNote('文件太大，终端上传上限 8 MB', false);
+  if (file.size > TERM_UPLOAD_MAX) return termNote('文件太大，上限 8 MB', false);
+  const isImage = file.type.startsWith('image/');
+  const card = { id: ++termUploadSeq, url: isImage ? URL.createObjectURL(file) : '', path: '', state: 'busy', isImage };
+  termCardList.push(card);
+  termRenderCards();
   const reader = new FileReader();
   reader.onload = () => {
-    const id = ++termUploadSeq;
-    termUploads.set(id, { file, url: file.type.startsWith('image/') ? URL.createObjectURL(file) : '' });
     const data = String(reader.result).split(',')[1] || '';
-    send({ t: 'term_file', id, name: file.name, data });
-    termNote('正在上传…');
+    send({ t: 'term_file', id: card.id, name: file.name, data });
   };
-  reader.onerror = () => termNote('读取文件失败', false);
+  reader.onerror = () => { card.state = 'failed'; termRenderCards(); termNote('读取文件失败', false); };
   reader.readAsDataURL(file);
 }
 
 function termFileDone(m) {
-  const item = termUploads.get(m.id);
-  termUploads.delete(m.id);
-  if (!m.ok) return termNote(m.error || '上传失败', false);
-  if (termOpen) send({ t: 'term_in', data: m.path + ' ' });
-  termNote('已放入终端输入框');
-  if (item?.url) {
-    const img = $('termPreview');
-    if (img.dataset.url) URL.revokeObjectURL(img.dataset.url);
-    img.src = item.url;
-    img.dataset.url = item.url;
-    img.hidden = false;
-    img.onclick = () => window.open(item.url, '_blank');
+  const card = termCardList.find(c => c.id === m.id);
+  if (!card) return;
+  if (m.ok) { card.state = 'done'; card.path = m.path; }
+  else { card.state = 'failed'; termNote(m.error || '上传失败', false); }
+  termRenderCards();
+}
+
+function termRemoveCard(id) {
+  const at = termCardList.findIndex(c => c.id === id);
+  if (at < 0) return;
+  const [card] = termCardList.splice(at, 1);
+  if (card.url) URL.revokeObjectURL(card.url);
+  termRenderCards();
+}
+
+function termRenderCards() {
+  const box = $('termCards');
+  box.innerHTML = '';
+  for (const card of termCardList) {
+    const el = document.createElement('div');
+    el.className = 'termCard' + (card.state === 'busy' ? ' busy' : '') + (card.state === 'failed' ? ' failed' : '') + (card.isImage ? '' : ' file');
+    if (card.isImage) {
+      const img = document.createElement('img');
+      img.src = card.url;
+      img.alt = '';
+      el.appendChild(img);
+    } else {
+      el.textContent = '文件';
+    }
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'x';
+    x.textContent = '×';
+    x.setAttribute('aria-label', '移除');
+    x.onclick = () => termRemoveCard(card.id);
+    el.appendChild(x);
+    box.appendChild(el);
   }
+  box.hidden = termCardList.length === 0;
 }
 
 // Shortcuts for the chat's buttons: typed into Claude Code, which runs the same commands.
