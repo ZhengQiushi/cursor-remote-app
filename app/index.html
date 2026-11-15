@@ -753,7 +753,7 @@ function connect() {
     authed = false;
     failures++;
     status('断开，重连中…', false);
-    await sleep(Math.min(8000, 800 * failures));
+    await sleep(Math.min(2500, 300 * failures));
     // After repeated failures the relay may have restarted on a new address; rediscover it.
     if (failures >= 3) { failures = 0; return boot(); }
     connect();
