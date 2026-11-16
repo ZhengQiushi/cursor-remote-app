@@ -409,6 +409,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 let base = null, info = null, ws = null, authed = false, failures = 0;
 let mode = store.get('mode') === 'term' ? 'term' : 'chat';
 let windows = [], sshRecent = [], currentWindow = null, windowHint = '';
+let currentSession = null; // the conversation shown inside the window, when the computer names one
 
 // Keep the layout above the on-screen keyboard.
 function fitViewport() {
@@ -809,6 +810,7 @@ function connect() {
       const changed = store.get('window') !== m.id;
       store.set('window', m.id);
       currentWindow = m.id;
+      if (m.session) currentSession = m.session;
       $('titleText').textContent = winLabel(m.title, m.sshHost).name;
       // The previous window's transcript must not stay on screen while the new one loads.
       if (changed) { itemsEl.replaceChildren(); cache.clear(); lastChat = null; }
@@ -817,6 +819,8 @@ function connect() {
       else if (mode === 'term') termAttach();
       send({ t: 'windows' });
     }
+    // The conversation inside the current window; 在 Cursor 里打开 needs this, not the window id.
+    else if (m.t === 'session') currentSession = m.id;
     else if (m.t === 'menu') showMenu(m.kind, m.items, m.max);
     else if (m.t === 'params') showParams(m);
     else if (m.t === 'changes') showChanges(m);
@@ -1797,7 +1801,9 @@ function renderChat(chat) {
 
   $('actionBar').innerHTML = buttonsHtml(chat.global, 'g');
   $('actionBar').classList.toggle('show', chat.global.length > 0);
-  renderQueue(chat.busy, chat.queued || [], chat.subagents || [], chat.readonly, chat.changed);
+  // The closed flag travels with this snapshot; renderQueue must not read it off the previous one, or a
+  // closed conversation briefly announces itself as a subagent view.
+  renderQueue(chat.busy, chat.queued || [], chat.subagents || [], chat.readonly, chat.changed, chat.closed);
   renderQuestions(chat.readonly ? null : chat.questions);
 
   if (stick) list.scrollTop = list.scrollHeight;
@@ -1845,11 +1851,11 @@ $('qnBar').addEventListener('keydown', e => {
   e.target.nextElementSibling.click();
 });
 
-function renderQueue(busy, queued, subs = [], readonly = false, changed = 0) {
+function renderQueue(busy, queued, subs = [], readonly = false, changed = 0, closed = false) {
   const bar = $('queueBar');
   let html = '';
   // A closed conversation is read-only until Cursor reopens it, so the bar offers that instead of a stop button.
-  if (readonly && lastChat?.closed) {
+  if (readonly && closed) {
     html += `<div class="run sub"><span>这段会话已经关闭，正在看它的历史</span><button data-wake>在 Cursor 里打开</button></div>`;
   } else if (readonly) html += `<div class="run sub"><span>正在查看子 Agent 的对话（只读）</span><button data-main>返回主对话</button></div>`;
   if (subs.length && !readonly) {
@@ -1890,13 +1896,18 @@ $('queueBar').onclick = async e => {
   const b = e.target.closest('button');
   if (!b) return;
   if ('changes' in b.dataset) { status('读取改动的文件…'); return send({ t: 'changes' }); }
-  if ('fold' in b.dataset) { subsOpen = !subsOpen; return renderQueue(lastChat?.busy, lastChat?.queued || [], lastChat?.subagents || [], lastChat?.readonly, lastChat?.changed); }
+  if ('fold' in b.dataset) { subsOpen = !subsOpen; return renderQueue(lastChat?.busy, lastChat?.queued || [], lastChat?.subagents || [], lastChat?.readonly, lastChat?.changed, lastChat?.closed); }
   if ('stop' in b.dataset) {
     if (!await ask('停止 Agent？\n它这一轮正在做的事会中断。', '停止')) return;
     send({ t: 'stop' }); status('已停止 Agent'); return;
   }
   if ('main' in b.dataset) { send({ t: 'mainChat' }); status('返回主对话…'); return; }
-  if ('wake' in b.dataset) { send({ t: 'wake', id: currentWindow || '' }); status('正在 Cursor 里打开这段会话，打开后会自动接上…'); return; }
+  if ('wake' in b.dataset) {
+    // reopen needs the conversation id; the window id would be refused as not a session.
+    if (!currentSession) return status('还没读到会话编号，稍等一下再点', false);
+    send({ t: 'wake', id: currentSession });
+    return status('正在 Cursor 里打开这段会话，打开后会自动接上…');
+  }
   if (b.dataset.sub) {
     if (b.dataset.part === 'stop' && !await ask(`停止子 Agent「${b.dataset.sub}」？\n它做到一半的工作会中断。`, '停止')) return;
     send({ t: 'subagent', name: b.dataset.sub, part: b.dataset.part });

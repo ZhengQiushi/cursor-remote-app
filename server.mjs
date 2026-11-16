@@ -1477,6 +1477,9 @@ class Session {
       }
       if (this.mode !== 'term') await this.setMode('chat');
       this.openSession(picked);
+      // The conversation inside the window is chosen after the window itself, so the phone is told its id
+      // separately; the 在 Cursor 里打开 button needs the conversation, not the window.
+      this.emit({ t: 'attached', id: win.id, title: win.title, sshHost: '', cwd: win.cwd, sessions: list.length, session: this.sessionId });
       return;
     }
     const wins = await listWindows();
@@ -1582,6 +1585,9 @@ class Session {
     if (!box) return false;
     this.claude = box;
     this.sessionId = row.id;
+    // Every conversation switch goes through here, so this is where the phone learns which conversation
+    // it is on (the window row it clicked carries a window id, not a conversation id).
+    this.emit({ t: 'session', id: row.id, closed: Boolean(box.closed) });
     this.emitClaudeChat(box.snapshot());
     if (box.closed) this.watchForWake(row.id);
     return true;
