@@ -8,8 +8,9 @@ const HELPER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'pty-help
 const SCROLLBACK = 400_000; // characters replayed to a phone that attaches later
 
 export class TerminalProcess {
-  constructor({ argv, cwd, cols, rows, session = '', onData, onExit }) {
+  constructor({ argv, cwd, cols, rows, session = '', key = '', onData, onExit }) {
     this.session = session;         // the conversation it resumes, '' for a new one
+    this.key = key;                 // what the phone asked for: a conversation id, '' or 'remote:<name>'
     this.onData = onData;
     this.onExit = onExit;
     this.backlog = '';

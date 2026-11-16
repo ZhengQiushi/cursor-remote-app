@@ -121,18 +121,46 @@ let terminal = null;
 // Session ids are UUIDs (Claude Code); anything else is refused so it cannot reach the command line.
 const SESSION_ID = /^[0-9a-f-]{36}$/i;
 
-function openTerminal(cols, rows, session) {
-  const want = SESSION_ID.test(session || '') ? session : '';
-  if (terminal?.alive && terminal.session === want) {
+// Remote computers the terminal can run Claude Code on, over ssh. Configured in config.json as
+// "remoteTerminals": [{ "name": "azure", "host": "20.127.145.35", "cwd": "~" }]. The name is what the
+// phone sends; the host and folder are checked so nothing else can reach the command line.
+const REMOTE_NAME = /^[A-Za-z0-9_-]{1,40}$/;
+const REMOTE_HOST = /^[A-Za-z0-9._-]+(@[A-Za-z0-9._-]+)?$/;
+const REMOTE_CWD = /^(~|~\/|\/)[A-Za-z0-9._\/-]*$/;
+const REMOTES = new Map();
+for (const r of Array.isArray(CONFIG.remoteTerminals) ? CONFIG.remoteTerminals : []) {
+  const name = String(r?.name ?? '');
+  const host = String(r?.host ?? '');
+  const cwd = String(r?.cwd || '~');
+  if (!REMOTE_NAME.test(name) || !REMOTE_HOST.test(host) || !REMOTE_CWD.test(cwd)) {
+    console.log(`!! remoteTerminals 配置无效，已忽略：${name || '(无名)'}`);
+    continue;
+  }
+  REMOTES.set(name, { name, host, cwd });
+}
+
+function remoteArgv(remote) {
+  // BatchMode: a password or host-key question would otherwise wait on a prompt nobody can see.
+  return ['ssh', '-tt', '-o', 'BatchMode=yes', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
+    remote.host, `cd ${remote.cwd} && exec claude`];
+}
+
+function openTerminal(cols, rows, session, host = '') {
+  const remote = host ? REMOTES.get(host) : null;
+  if (host && !remote) throw new Error('没有这台远程电脑的配置');
+  const want = remote ? '' : (SESSION_ID.test(session || '') ? session : '');
+  const key = remote ? `remote:${remote.name}` : want;
+  if (terminal?.alive && terminal.key === key) {
     terminal.resize(cols, rows);
     return false;
   }
-  // Another conversation is open here: end it first, so the phone gets the one it asked for.
+  // Another conversation or computer is open here: end it first, so the phone gets the one it asked for.
   if (terminal?.alive) terminal.close();
   // A terminal that was closed on purpose (restart) must not speak for its successor.
   const term = new TerminalProcess({
-    argv: want ? [TERMINAL_BIN, '--resume', want] : [TERMINAL_BIN],
+    argv: remote ? remoteArgv(remote) : (want ? [TERMINAL_BIN, '--resume', want] : [TERMINAL_BIN]),
     session: want,
+    key,
     cwd: CLAUDE_CWD,
     cols,
     rows,
@@ -1935,7 +1963,13 @@ class Session {
   handleTerminal(msg) {
     if (msg.t === 'term_open') {
       terminalViewers.add(this);
-      const started = openTerminal(msg.cols, msg.rows, msg.session);
+      let started;
+      try {
+        started = openTerminal(msg.cols, msg.rows, msg.session, String(msg.host || ''));
+      } catch (e) {
+        return this.emit({ t: 'status', ok: false, msg: e.message });
+      }
+      this.emit({ t: 'term_hosts', hosts: [...REMOTES.keys()], current: String(msg.host || '') });
       // A phone that attaches to a running terminal first gets what is already on its screen.
       if (!started) this.emit({ t: 'term', data: terminal.backlog, replay: true });
       return;
@@ -1964,6 +1998,7 @@ class Session {
       const size = Number(msg.size);
       if (!Number.isInteger(size) || size <= 0 || size > TERM_FILE_MAX) throw new Error('文件太大，终端上传上限 8 MB');
       this.termFileCancel(id);
+      if (terminal?.key?.startsWith('remote:')) throw new Error('远程电脑上的终端暂不支持传图片或文件');
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-remote-term-'));
       this.termUploads.set(id, { dir, file: path.join(dir, 'upload'), name: String(msg.name || 'file'), size, got: 0, next: 0 });
     } catch (e) {

@@ -286,6 +286,7 @@
   <section id="termView" class="view">
     <div class="tools">
       <span id="termState">未连接</span>
+      <select id="termHost" hidden aria-label="选择电脑"></select>
       <button id="termRestart">重新开始</button>
     </div>
     <div id="termBox"></div>
@@ -800,6 +801,7 @@ function connect() {
     else if (m.t === 'term_exit') termEnded(m.code);
     else if (m.t === 'term_file') termFileDone(m);
     else if (m.t === 'term_file_ack') termFileAck(m);
+    else if (m.t === 'term_hosts') termFillHosts(m);
     else if (m.t === 'windows') { windows = m.list; sshRecent = m.ssh || []; currentWindow = m.current; windowHint = m.hint || ''; if (sheetKind === 'windows') showWindows(); }
     else if (m.t === 'sshTargets') { sshHosts = m.hosts || []; renderSsh(); }
     else if (m.t === 'attached') {
@@ -1287,6 +1289,22 @@ function termFitSend() {
 }
 
 // Opens (or re-attaches to) the computer's terminal. A running one replays what its screen shows.
+// The computer the terminal runs on: this one, or a remote one set up in config.json.
+let termHostPick = '';
+function termFillHosts(m) {
+  const sel = $('termHost');
+  sel.innerHTML = '';
+  sel.add(new Option('本机', ''));
+  for (const name of m.hosts || []) sel.add(new Option(name, name));
+  sel.hidden = !(m.hosts && m.hosts.length);
+  termHostPick = m.current || '';
+  sel.value = termHostPick;
+}
+$('termHost').onchange = () => {
+  termHostPick = $('termHost').value;
+  termAttach();
+};
+
 function termAttach() {
   if (!authed) return;
   termEnsure();
@@ -1297,7 +1315,9 @@ function termAttach() {
     termSize = termScreen.cols + 'x' + termScreen.rows;
     termSetState('连接中…');
     // The conversation the phone is on (the chat's); the terminal resumes it so its history shows.
-    send({ t: 'term_open', cols: termScreen.cols, rows: termScreen.rows, session: store.get('window') || '' });
+    // A remote computer starts its own new Claude Code; a local one resumes the conversation on the phone.
+    const host = termHostPick || '';
+    send({ t: 'term_open', cols: termScreen.cols, rows: termScreen.rows, host, session: host ? '' : (store.get('window') || '') });
   });
 }
 
