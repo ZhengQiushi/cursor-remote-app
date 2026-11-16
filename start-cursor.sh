@@ -41,4 +41,4 @@ nohup bash -c "
 " >"$LOG" 2>&1 &
 disown
 
-echo "Cursor 将退出并带调试端口重新打开（结果见 $LOG）"
+echo "Cursor 将退出并带调试端口重新打开（结果见 ${LOG}）"

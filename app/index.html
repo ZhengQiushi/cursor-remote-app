@@ -805,12 +805,16 @@ function connect() {
     else if (m.t === 'windows') { windows = m.list; sshRecent = m.ssh || []; currentWindow = m.current; windowHint = m.hint || ''; if (sheetKind === 'windows') showWindows(); }
     else if (m.t === 'sshTargets') { sshHosts = m.hosts || []; renderSsh(); }
     else if (m.t === 'attached') {
+      // In Claude mode `m.id` is the Cursor window; the conversation inside it is chosen separately (历史).
+      const changed = store.get('window') !== m.id;
       store.set('window', m.id);
       currentWindow = m.id;
       $('titleText').textContent = winLabel(m.title, m.sshHost).name;
+      // The previous window's transcript must not stay on screen while the new one loads.
+      if (changed) { itemsEl.replaceChildren(); cache.clear(); lastChat = null; }
       if (mode === 'ssh') setMode('chat');
-      // On the terminal tab, the picked conversation's terminal replaces the one on screen.
-      if (mode === 'term') termAttach();
+      // A window on the terminal tab opens its own terminal; leaving term mode would stop its output.
+      else if (mode === 'term') termAttach();
       send({ t: 'windows' });
     }
     else if (m.t === 'menu') showMenu(m.kind, m.items, m.max);
@@ -897,12 +901,38 @@ function switchComputer(id) {
   boot();
 }
 
+// Where a conversation is driven: a Cursor window's Claude panel, a terminal CLI, or something closed.
+function kindTag(w) {
+  if (w.kind !== 'claude') return KIND_TAG[w.kind] || '';
+  if (w.live === false) return '已关闭';
+  return w.inCursor ? 'Cursor' : '终端';
+}
+
+// Top sheet: one row per Cursor window on the computer, not per conversation. Its conversations are what
+// the 历史 button lists after the window is picked.
+// A remote window's history is fetched over ssh and can take several seconds; say so instead of looking stuck.
+function historyWaitText() {
+  const cur = windows.find(w => w.id === currentWindow);
+  return cur?.remote ? '正在从远程电脑读取会话，可能要十几秒…' : '读取这个窗口的历史对话…';
+}
+function newChatWaitText() {
+  const cur = windows.find(w => w.id === currentWindow);
+  return cur?.remote ? '远程窗口不能从手机新建会话' : '正在这个 Cursor 窗口里新建会话…';
+}
+
 function showWindows() {
-  const rows = windows.map(w => {
+  const row = w => {
     const label = winLabel(w.title || w.id, w.sshHost);
+    // A remote window's conversation count would need an ssh round trip per row, so it shows the host instead.
+    const sub = w.remote
+      ? '远程窗口 · 会话点「历史」看'
+      : label.file
+        ? label.file
+        : typeof w.sessions === 'number' ? `${w.sessions} 个会话` : '';
     return `<button class="opt ${w.id === currentWindow ? 'cur' : ''}" data-win="${esc(w.id)}">
-    <span class="tag">${KIND_TAG[w.kind] || ''}</span><span class="lbl">${esc(label.name)}${label.file ? `<span class="sub">${esc(label.file)}</span>` : ''}</span></button>`;
-  }).join('');
+    <span class="tag">${w.remote ? 'SSH' : (KIND_TAG[w.kind] || '')}</span><span class="lbl">${esc(label.name)}${sub ? `<span class="sub">${esc(sub)}</span>` : ''}</span></button>`;
+  };
+  const rows = windows.map(row).join('');
   const sshRows = sshRecent.map(s => `<button class="opt" data-ssh-host="${esc(s.host)}" data-ssh-root="${esc(s.root)}">
     <span class="tag">${s.open ? '重连' : '打开'}</span><span class="lbl">${esc(s.name)}<span class="sub">${esc(s.host)} · ${esc(s.root)}</span></span></button>`).join('');
   openSheet('windows', `<h3>切换窗口</h3>${rows || `<div class="hint">${esc(windowHint || '没有找到窗口')}</div>`}
@@ -917,6 +947,18 @@ function showMenu(kind, items, max) {
   const maxRow = typeof max === 'boolean'
     ? `<button class="opt" data-max><span class="lbl">MAX Mode<span class="sub">更大上下文、更贵</span></span><span class="switch ${max ? 'on' : ''}"></span></button>` : '';
   const hasGroups = items.some(it => it.group);
+  // A history row carries whether its conversation is still running and where it lives; other menus do not.
+  const subOf = it => it.live === false
+    ? `已关闭${it.when ? ` · ${it.when}` : ''} · 点开会重新打开`
+    : (it.when || '');
+  const tagOf = it => it.live === false ? '已关闭' : it.inCursor ? 'Cursor' : (kind === 'history' ? '终端' : '');
+  const pickOf = (kind, it) => {
+    const tag = tagOf(it);
+    const sub = subOf(it);
+    return `<button class="opt ${it.checked ? 'cur' : ''}" data-kind="${kind}" data-label="${esc(it.label)}">`
+      + (tag ? `<span class="tag">${esc(tag)}</span>` : '')
+      + `<span class="lbl">${esc(it.label)}${sub ? `<span class="sub">${esc(sub)}</span>` : ''}</span></button>`;
+  };
   let body = '';
   if (hasGroups) {
     const groups = new Map();
@@ -928,13 +970,13 @@ function showMenu(kind, items, max) {
     for (const [g, list] of groups) {
       body += `<div class="menuGroup">${esc(g)}</div>`;
       body += list.map(it => {
-        const pick = `<button class="opt ${it.checked ? 'cur' : ''}" data-kind="${kind}" data-label="${esc(it.label)}"><span class="lbl">${esc(it.label)}</span></button>`;
+        const pick = pickOf(kind, it);
         return it.params ? `<div class="optRow">${pick}<button class="paramBtn" data-params="${esc(it.id)}" data-plabel="${esc(it.label)}">参数</button></div>` : pick;
       }).join('');
     }
   } else {
     body = items.map(it => {
-      const pick = `<button class="opt ${it.checked ? 'cur' : ''}" data-kind="${kind}" data-label="${esc(it.label)}"><span class="lbl">${esc(it.label)}</span></button>`;
+      const pick = pickOf(kind, it);
       return it.params ? `<div class="optRow">${pick}<button class="paramBtn" data-params="${esc(it.id)}" data-plabel="${esc(it.label)}">参数</button></div>` : pick;
     }).join('');
   }
@@ -1314,10 +1356,10 @@ function termAttach() {
     termOpen = true;
     termSize = termScreen.cols + 'x' + termScreen.rows;
     termSetState('连接中…');
-    // The conversation the phone is on (the chat's); the terminal resumes it so its history shows.
-    // A remote computer starts its own new Claude Code; a local one resumes the conversation on the phone.
+    // The terminal starts its own Claude Code here; the conversation is picked from 历史. What is stored
+    // in `window` is now a Cursor window id, which is not a conversation, so it is never sent as one.
     const host = termHostPick || '';
-    send({ t: 'term_open', cols: termScreen.cols, rows: termScreen.rows, host, session: host ? '' : (store.get('window') || '') });
+    send({ t: 'term_open', cols: termScreen.cols, rows: termScreen.rows, host, session: '' });
   });
 }
 
@@ -1507,8 +1549,9 @@ function termRenderCards() {
 }
 
 // Shortcuts for the chat's buttons: typed into Claude Code, which runs the same commands.
-// 历史 opens the phone's own list (with each conversation's topic), not Claude Code's bare-id picker.
-$('termHistory').onclick = () => { status('读取历史对话…'); send({ t: 'openMenu', kind: 'history' }); };
+// 历史 lists this Cursor window's conversations (including closed ones) and switches the terminal to the
+// picked one; it never shows Claude Code's bare-id picker.
+$('termHistory').onclick = () => { status(historyWaitText()); send({ t: 'openMenu', kind: 'history' }); };
 $('termModel').onclick = () => termKeyText('/model\r');
 $('termMode').onclick = () => termKeyText('\x1b[Z');
 function termKeyText(data) {
@@ -1805,7 +1848,10 @@ $('qnBar').addEventListener('keydown', e => {
 function renderQueue(busy, queued, subs = [], readonly = false, changed = 0) {
   const bar = $('queueBar');
   let html = '';
-  if (readonly) html += `<div class="run sub"><span>正在查看子 Agent 的对话（只读）</span><button data-main>返回主对话</button></div>`;
+  // A closed conversation is read-only until Cursor reopens it, so the bar offers that instead of a stop button.
+  if (readonly && lastChat?.closed) {
+    html += `<div class="run sub"><span>这段会话已经关闭，正在看它的历史</span><button data-wake>在 Cursor 里打开</button></div>`;
+  } else if (readonly) html += `<div class="run sub"><span>正在查看子 Agent 的对话（只读）</span><button data-main>返回主对话</button></div>`;
   if (subs.length && !readonly) {
     html += `<button class="qh fold" data-fold>${subsOpen ? '▾' : '▸'} <span>子 Agent 运行中 ${subs.length} 个</span></button>`;
     if (subsOpen) html += subs.map(n => `<div class="q"><span class="qt sa">${esc(n)}</span>`
@@ -1850,6 +1896,7 @@ $('queueBar').onclick = async e => {
     send({ t: 'stop' }); status('已停止 Agent'); return;
   }
   if ('main' in b.dataset) { send({ t: 'mainChat' }); status('返回主对话…'); return; }
+  if ('wake' in b.dataset) { send({ t: 'wake', id: currentWindow || '' }); status('正在 Cursor 里打开这段会话，打开后会自动接上…'); return; }
   if (b.dataset.sub) {
     if (b.dataset.part === 'stop' && !await ask(`停止子 Agent「${b.dataset.sub}」？\n它做到一半的工作会中断。`, '停止')) return;
     send({ t: 'subagent', name: b.dataset.sub, part: b.dataset.part });
@@ -1917,8 +1964,14 @@ document.addEventListener('click', async e => {
 
 $('pickMode').onclick = () => { status('读取模式列表…'); send({ t: 'openMenu', kind: 'mode' }); };
 $('pickModel').onclick = () => { status('读取模型列表…'); send({ t: 'openMenu', kind: 'model' }); };
-$('pickHistory').onclick = () => { status('读取历史对话…'); send({ t: 'openMenu', kind: 'history' }); };
-$('newChat').onclick = () => { send({ t: 'newChat' }); clearImageCards(); status('已新建对话'); };
+$('pickHistory').onclick = () => { status(historyWaitText()); send({ t: 'openMenu', kind: 'history' }); };
+// The computer has to raise the window and wait for a new Claude process, so the phone only says it
+// started; the real result arrives as a status line from the relay.
+$('newChat').onclick = () => {
+  send({ t: 'newChat' });
+  clearImageCards();
+  status(newChatWaitText());
+};
 
 /* ---------- file viewer ---------- */
 $('vBody').classList.toggle('wrap', store.get('wrap') !== 'off');

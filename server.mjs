@@ -14,8 +14,12 @@ import {
   removeDevice, totpConfig, verifyTotp, needsTotp, saveState, appBase,
 } from './auth.mjs';
 import { pushPublicKey, openEventStream, closeEventStreams, addViewer, removeViewer, deliver, startWatcher } from './notify.mjs';
-import { listClaudeClients, inboxFor, stopRelayOwnedSessions, isClaudeBackend, claudeCwd, whichClaude } from './claude.mjs';
+import {
+  listClaudeClients, listClaudeHistory, listCursorWindows, labelHistory, remoteClaudeHistory,
+  inboxFor, dropInbox, stopRelayOwnedSessions, isClaudeBackend, claudeCwd, whichClaude,
+} from './claude.mjs';
 import { TerminalProcess } from './terminal.mjs';
+import { sendToComposer, stopTurn, composerState, pendingQuestion, answerQuestion } from './composer.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3939);
@@ -152,6 +156,17 @@ function openTerminal(cols, rows, session, host = '') {
   if (host && !remote) throw new Error('没有这台远程电脑的配置');
   const want = remote ? '' : (SESSION_ID.test(session || '') ? session : '');
   const key = remote ? `remote:${remote.name}` : want;
+  // A conversation that is already running somewhere is not resumed here: a second process would append
+  // to the same transcript alongside the first. It is read and driven through its own channel instead.
+  // A closed one has no process left, so the terminal may resume it as before.
+  if (want) {
+    const known = listClaudeHistory({ cwd: CLAUDE_CWD }).find(c => c.id === want);
+    if (known && known.live !== false) {
+      throw new Error(known.inCursor
+        ? '这段会话在 Cursor 窗口里运行。终端不复制它：切到「对话」标签可以直接读和发消息'
+        : '这段会话已经在终端里运行。终端不复制它：切到「对话」标签可以直接读和发消息');
+    }
+  }
   if (terminal?.alive && terminal.key === key) {
     terminal.resize(cols, rows);
     return false;
@@ -173,13 +188,20 @@ function openTerminal(cols, rows, session, host = '') {
   return true;
 }
 
+// The windows on this machine. In Claude mode a window is a Cursor window, not a conversation: the
+// conversations inside it are what the 历史 button lists. A window opened over SSH is listed too; its
+// Claude Code runs on that host, so its conversations are fetched from there when the row is used.
 async function listWindows() {
   if (CLAUDE_MODE) {
-    return listClaudeClients().map(c => ({
-      id: c.id,
-      title: c.title,
+    return listCursorWindows().map(w => ({
+      id: w.id,
+      title: w.cwd,
       ws: '',
       kind: 'claude',
+      cwd: w.cwd,
+      name: w.name,
+      host: w.host || '',
+      remote: Boolean(w.remote),
     }));
   }
   const res = await fetch(`${CDP_URL}/json/list`).catch(() => {
@@ -196,18 +218,102 @@ async function listWindows() {
     }));
 }
 
-function claudeClient(id) {
-  const list = listClaudeClients();
+// The Cursor windows, read synchronously so attach can stay a plain call.
+function listWindowsSync() {
+  return listCursorWindows().map(w => ({
+    id: w.id,
+    title: w.cwd,
+    ws: '',
+    kind: 'claude',
+    cwd: w.cwd,
+    name: w.name,
+    host: w.host || '',
+    remote: Boolean(w.remote),
+  }));
+}
+
+function claudeClient(id, cwd = '') {
+  const list = listClaudeHistory({ cwd });
   return list.find(c => c.id === id) || null;
 }
 
-function openClaudeInbox(id) {
-  const client = claudeClient(id);
+function openClaudeInbox(id, cwd = '', row = null) {
+  const client = row || claudeClient(id, cwd);
   if (!client) return null;
   return inboxFor(client, chat => {
     for (const v of claudeViewers) {
-      if (v.targetId === id) v.emitClaudeChat?.(chat);
+      if (v.sessionId === id) v.emitClaudeChat?.(chat);
     }
+  });
+}
+
+// The Claude Code panel in a Cursor window runs its own process per conversation and registers a URI
+// handler for it, so asking Cursor to open the conversation puts it back in that panel. A conversation
+// that already has a live process is left alone: opening it again would start a second copy.
+const SESSION_URI = /^[0-9a-f-]{36}$/i;
+
+function openSessionInCursor(id) {
+  if (!SESSION_URI.test(id)) throw new Error('会话编号无效');
+  const url = `cursor://Anthropic.claude-code/open?session=${encodeURIComponent(id)}`;
+  const child = spawn(cursorCli(), ['--open-url', url], { detached: true, stdio: 'ignore' });
+  child.on('error', () => {});
+  child.unref();
+}
+
+// The extension's "New Conversation" command acts on whichever Claude panel is in front, so the phone
+// first brings the window it is looking at to the front and then asks the extension for a new conversation.
+// `cursor -r <folder>` goes through Cursor's own IPC, so it works from a background service where
+// AppleScript's accessibility calls are refused, and needs no macOS permission.
+function raiseCursorWindow(folder) {
+  if (!folder) return Promise.resolve(false);
+  return spawnDetached(cursorCli(), ['-r', folder]);
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Opens a fresh conversation in the window's Claude panel and returns the session id it created.
+// The extension picks the id, so it is read back from ~/.claude/sessions rather than guessed. Only a
+// session in this window's folder counts: another window can create one at the same moment.
+async function newConversationIn(windowFolder) {
+  const before = new Set(readSessionIds(windowFolder));
+  const raised = await raiseCursorWindow(windowFolder);
+  if (!raised) throw new Error('没有找到这个 Cursor 窗口，先在电脑上把它打开');
+  // The panel only takes the request once its window is really in front.
+  await sleep(400);
+  const ok = await spawnDetached(cursorCli(), ['--open-url', 'cursor://Anthropic.claude-code/open']);
+  if (!ok) throw new Error('没能让 Cursor 新建会话');
+  // A new Claude process has to start before its session file exists, so this waits rather than sleeps once.
+  for (let i = 0; i < 60; i++) {
+    await sleep(250);
+    const fresh = readSessionIds(windowFolder).filter(id => !before.has(id));
+    if (fresh.length) return fresh[0];
+  }
+  return '';
+}
+
+// Session ids whose Claude Code runs in this folder. An empty folder matches everything.
+function readSessionIds(cwd = '') {
+  const dir = path.join(os.homedir(), '.claude', 'sessions');
+  let names = [];
+  try { names = fs.readdirSync(dir).filter(n => n.endsWith('.json')); } catch { return []; }
+  const ids = [];
+  for (const name of names) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      if (!meta?.sessionId) continue;
+      if (cwd && meta.cwd !== cwd) continue;
+      ids.push(meta.sessionId);
+    } catch {}
+  }
+  return ids;
+}
+
+function spawnDetached(bin, args) {
+  return new Promise(resolve => {
+    const child = spawn(bin, args, { detached: true, stdio: 'ignore' });
+    child.on('error', () => resolve(false));
+    child.unref();
+    setTimeout(() => resolve(true), 300);
   });
 }
 
@@ -819,6 +925,12 @@ class Session {
     this.visible = true;
     this.cdp = null;
     this.claude = null;
+    // The window the phone is on, and the conversation shown inside it (Claude mode).
+    this.targetId = '';
+    this.windowCwd = '';
+    this.windowHost = '';      // set when the window is a Cursor SSH window; its files live on that host
+    this.remoteRows = null;    // the last remote conversation list fetched for that window
+    this.sessionId = '';
     this.claudeImages = [];
     this.termUploads = new Map(); // id -> an upload in progress from this phone
     this.viewport = { w: 1000, h: 800 };
@@ -835,6 +947,8 @@ class Session {
     this.ossUp = new Map();
     this.ossStaged = new Map();
     this.idleTimer = setInterval(() => this.pollIfIdle(), 2000);
+    // In Claude mode the panel's DOM is where a pending question shows up; the transcript never carries it.
+    if (CLAUDE_MODE) this.questionTimer = setInterval(() => this.refreshClaudeQuestion().catch(() => {}), 2500);
     if (CLAUDE_MODE) claudeViewers.add(this);
   }
 
@@ -1325,24 +1439,44 @@ class Session {
     });
   }
 
+  // In Claude mode the phone first attaches to a Cursor window. The conversation it shows is that
+  // window's latest one (or a specific one when a history row is picked); switching window never
+  // starts or stops a Claude process.
   async attach(targetId, sshHost = '') {
     this.detach();
     if (CLAUDE_MODE) {
-      const list = listClaudeClients();
-      const picked = list.find(c => c.id === targetId) || list[0];
-      if (!picked) {
-        this.emit({ t: 'status', ok: false, msg: '没有正在运行的 Claude Code。先在项目目录里运行 claude' });
+      const wins = listWindowsSync();
+      const win = wins.find(w => w.id === targetId) || wins[0];
+      if (!win) {
+        this.emit({ t: 'status', ok: false, msg: '没有打开的 Cursor 窗口。先在这台电脑上打开一个窗口' });
         return;
       }
-      const box = openClaudeInbox(picked.id);
-      this.claude = box;
-      this.targetId = picked.id;
-      this.winTitle = picked.title;
-      this.emit({ t: 'attached', id: picked.id, title: picked.title, sshHost: '' });
-      // On the terminal tab the phone reopens the terminal itself; leaving the mode here would stop its output.
-      if (this.mode === 'term') return;
-      await this.setMode('chat');
-      this.emitClaudeChat(box.snapshot());
+      this.targetId = win.id;
+      this.windowCwd = win.cwd;
+      this.windowHost = win.host || '';
+      this.remoteRows = null;
+      // A new window means a new set of conversations; the old window's transcript must not linger on
+      // the phone while the new one is read.
+      this.lastChat = '';
+      const list = this.windowHost
+        ? labelHistory(await remoteClaudeHistory(this.windowHost, win.cwd))
+        : listClaudeHistory({ cwd: win.cwd });
+      if (this.windowHost) this.remoteRows = list;
+      // Prefer what is running in the plugin, then anything else running, then history.
+      const picked = list.find(r => r.inCursor && r.live !== false) || list.find(r => r.live !== false) || list[0];
+      this.emit({ t: 'attached', id: win.id, title: win.title, sshHost: '', cwd: win.cwd, sessions: list.length });
+      if (!picked) {
+        // A window whose folder has never had a conversation: nothing to show yet, but the window is selectable.
+        this.claude = null;
+        this.sessionId = '';
+        if (this.mode !== 'term') {
+          await this.setMode('chat');
+          this.emit({ t: 'chat', chat: null });
+        }
+        return;
+      }
+      if (this.mode !== 'term') await this.setMode('chat');
+      this.openSession(picked);
       return;
     }
     const wins = await listWindows();
@@ -1367,9 +1501,122 @@ class Session {
     await this.setMode(this.mode);
   }
 
+  // A message the person typed on the phone. In a local Cursor window it goes into the panel's own
+  // composer and is sent with Enter, so Claude records an ordinary user turn. The peer socket is not a
+  // fallback for text: a message that arrives that way is wrapped as "another Claude session sent a
+  // message" with no sender, which the model then tries to answer as a teammate — the exact problem
+  // this replaced. Only pictures, which have no keyboard equivalent, still use the socket.
+  async sendClaudeMessage(text, images, submit) {
+    const c = this.claude;
+    if (!c) throw new Error('这个窗口没有正在运行的 Claude Code');
+    if (this.windowHost) return c.sendMessage(text, { images, submit });
+    if (images.length) return c.sendMessage(text, { images, submit });
+    if (c.closed) throw new Error('这个会话已经关闭。点上面的「在 Cursor 里打开」，等它跑起来再发');
+    const body = String(text || '').trim();
+    if (!body) throw new Error('内容不能为空');
+    // What the target conversation should already show. The panel may be displaying a different one
+    // (another tab's, or another project's), and typing there would reach the wrong conversation.
+    const expect = c.confirmText?.() || '';
+    const result = await sendToComposer(this.windowCwd, body, { submit, expect, sessionId: this.sessionId });
+    if (result.sent) this.emit({ t: 'status', ok: true, msg: '已发送' });
+    return false;
+  }
+
+  // Answers the Agent's question by clicking the option in the Cursor panel. The panel takes the answer
+  // through its own controls, so nothing is injected as typed text.
+  async answerClaudeQuestion(msg) {
+    if (this.windowHost) throw new Error('远程窗口需要在远程电脑上回答');
+    const c = this.claude;
+    if (!c) throw new Error('这个窗口没有正在运行的 Claude Code');
+    // 'skip' means let the panel's own skip control take it; anything else clicks an option.
+    const part = ['option', 'submit', 'skip'].includes(msg.part) ? msg.part : 'option';
+    if (part === 'skip') throw new Error('在电脑上点「跳过」；手机只支持选项和提交');
+    const option = Number(msg.oi);
+    const r = await answerQuestion(this.windowCwd, {
+      option: Number.isInteger(option) && option >= 0 ? option : -1,
+      submit: part !== 'option',
+    });
+    if (r?.ok) {
+      this.emit({ t: 'status', ok: true, msg: part === 'submit' ? '已提交答案' : '已选择' });
+      setTimeout(async () => {
+        const q = await pendingQuestion(this.windowCwd).catch(() => null);
+        c.setQuestion?.(q);
+      }, 900);
+    }
+    return r;
+  }
+
+  // Reads the panel for a question the Agent is waiting on, so the phone can show its card.
+  async refreshClaudeQuestion() {
+    if (!CLAUDE_MODE || this.windowHost || !this.claude) return;
+    const q = await pendingQuestion(this.windowCwd).catch(() => null);
+    this.claude.setQuestion?.(q);
+  }
+
+  // Stops whatever is running in this window's Claude panel.
+  async stopClaudeTurn() {
+    const c = this.claude;
+    if (this.windowHost) throw new Error('远程窗口需要在远程电脑上停止');
+    if (!c) throw new Error('这个窗口没有正在运行的 Claude Code');
+    try {
+      const r = await stopTurn(this.windowCwd);
+      if (!r.stopped) throw new Error(r.why || '没有正在运行的一轮');
+      this.emit({ t: 'status', ok: true, msg: '已停止' });
+      setTimeout(() => c.refresh?.(), 800);
+      return;
+    } catch (e) {
+      if (!/没有正在运行/.test(e.message)) throw e;
+    }
+    throw new Error('没有正在运行的一轮');
+  }
+
+  // Shows one conversation of the current window. A closed one is read-only until it is reopened;
+  // sending a message to it asks Cursor to open it first.
+  openSession(rowOrId) {
+    const row = typeof rowOrId === 'string'
+      ? (this.windowHost ? (this.remoteRows || []).find(r => r.id === rowOrId)
+        : listClaudeHistory({ cwd: this.windowCwd || '' }).find(r => r.id === rowOrId))
+      : rowOrId;
+    if (!row) return false;
+    const box = openClaudeInbox(row.id, this.windowCwd || '', row);
+    if (!box) return false;
+    this.claude = box;
+    this.sessionId = row.id;
+    this.emitClaudeChat(box.snapshot());
+    if (box.closed) this.watchForWake(row.id);
+    return true;
+  }
+
+  // Waits for a closed conversation to be opened again, then shows the process that now runs it.
+  watchForWake(id) {
+    clearInterval(this.wakeTimer);
+    const deadline = Date.now() + 60_000;
+    this.wakeTimer = setInterval(async () => {
+      if (this.sessionId !== id || Date.now() > deadline) { clearInterval(this.wakeTimer); this.wakeTimer = null; return; }
+      let now;
+      if (this.windowHost) {
+        // A remote host is asked at a slower pace: each check is a round trip across the network.
+        this.wakeTicks = (this.wakeTicks || 0) + 1;
+        if (this.wakeTicks % 4 !== 1) return;
+        now = (await remoteClaudeHistory(this.windowHost, this.windowCwd || '').catch(() => [])).find(c => c.id === id);
+      } else {
+        now = listClaudeHistory({ cwd: this.windowCwd || '' }).find(c => c.id === id);
+      }
+      if (!now || now.live === false) return;
+      clearInterval(this.wakeTimer);
+      this.wakeTimer = null;
+      // A fresh inbox for the process Cursor just started; the old closed one only held the transcript.
+      dropInbox(id);
+      this.openSession(id);
+    }, 1500);
+  }
+
   detach() {
     clearInterval(this.chatTimer);
+    clearInterval(this.wakeTimer);
+    this.wakeTimer = null;
     this.claude = null;
+    this.sessionId = '';
     if (this.cdp) {
       const cdp = this.cdp;
       this.cdp = null;
@@ -1753,32 +2000,92 @@ class Session {
     return rels;
   }
 
+  // The conversations of the window the phone is on. This is the 历史 list: everything that window's
+  // Claude Code panel has, including conversations that are no longer running.
+  windowHistory() {
+    // A window opened over SSH keeps its conversations on that host, so they come from there.
+    const list = this.windowHost
+      ? this.remoteRows || []
+      : listClaudeHistory({ cwd: this.windowCwd || '' });
+    return list.map(r => ({
+      label: r.name,
+      value: r.id,
+      id: r.id,
+      checked: r.id === this.sessionId,
+      live: r.live !== false,
+      inCursor: Boolean(r.inCursor),
+      when: r.when || '',
+      group: r.inCursor ? 'Cursor 插件' : '终端',
+    }));
+  }
+
   async handleClaude(msg) {
-    if (!this.claude) throw new Error('尚未连接到 Claude CLI');
     const c = this.claude;
+    // History belongs to the window, not to the conversation, so it is answered before the conversation
+    // check: a window with nothing running still lists what it used to run.
+    if (msg.t === 'openMenu' && msg.kind === 'history') {
+      // A remote window's list costs a round trip, so it is fetched here, where a slow ssh cannot hold up
+      // the socket, and kept until the next ask.
+      if (this.windowHost) {
+        this.remoteRows = await remoteClaudeHistory(this.windowHost, this.windowCwd || '');
+        this.remoteRows = labelHistory(this.remoteRows);
+      }
+      return this.emit({ t: 'menu', kind: 'history', items: this.windowHistory(), max: null });
+    }
+    if (msg.t === 'pickMenu' && msg.kind === 'history') {
+      const label = String(msg.label || '');
+      const hit = this.windowHistory().find(r => r.label === label || r.id === label || r.id === msg.value);
+      if (!hit) throw new Error('找不到这段历史对话');
+      // A closed conversation has no process. Cursor opens it, and the phone follows once it is running.
+      if (hit.live === false) {
+        openSessionInCursor(hit.id);
+        this.emit({ t: 'status', ok: true, msg: '正在 Cursor 里打开这段会话…' });
+        this.openSession(hit.id);
+        return;
+      }
+      this.openSession(hit.id);
+      return this.emit({ t: 'status', ok: true, msg: '已切换到这个会话' });
+    }
+    // New conversation belongs to the window, not to the conversation that happens to be open in it, so it
+    // is answered before the check for a running one (a window with no conversation can still start one).
+    if (msg.t === 'newChat') {
+      if (this.windowHost) throw new Error('远程窗口的 Claude Code 在远程电脑上，请在那边新建会话');
+      const id = await newConversationIn(this.windowCwd);
+      if (!id) throw new Error('Cursor 没有在 10 秒内新建出会话，请在电脑上看一下');
+      // The new process takes a moment to register its peer socket; until then it is still readable from
+      // its transcript, so the phone switches either way.
+      for (let i = 0; i < 12; i++) {
+        const row = listClaudeHistory({ cwd: this.windowCwd || '' }).find(r => r.id === id);
+        if (row) { this.openSession(row); break; }
+        await sleep(300);
+      }
+      this.lastChat = '';
+      if (this.mode !== 'term') await this.setMode('chat');
+      return this.emit({ t: 'status', ok: true, msg: '已在 Cursor 窗口里新建会话' });
+    }
+    if (!c) throw new Error('这个窗口没有正在运行的 Claude Code');
     switch (msg.t) {
       case 'openMenu': {
         const items = await c.openMenu(msg.kind);
         return this.emit({ t: 'menu', kind: msg.kind, items, max: null });
       }
       case 'pickMenu': {
-        // On the terminal tab, a picked conversation becomes the terminal on screen (its own terminal, resumed).
-        if (this.mode === 'term' && msg.kind === 'history') {
-          const rows = c.historyMenu();
-          const hit = rows.find(r => r.label === msg.label) || rows.find(r => r.id === msg.label);
-          if (!hit) throw new Error('找不到这段历史对话');
-          return this.emit({ t: 'attached', id: hit.id, title: hit.label, sshHost: '' });
-        }
         await c.pickMenu(msg.kind, msg.label);
         return this.emit({ t: 'status', ok: true, msg: '已发送到终端' });
+      }
+      // A message typed while the conversation is closed: Cursor opens it, then the message is posted to
+      // the process that now runs it. Nothing is resumed here, so the two never write the same transcript.
+      case 'wake': {
+        const id = String(msg.id || this.sessionId || '');
+        if (!SESSION_URI.test(id)) throw new Error('会话编号无效');
+        openSessionInCursor(id);
+        return this.emit({ t: 'status', ok: true, msg: '正在 Cursor 里打开这段会话，稍等一下再发' });
       }
       case 'toggleMax':
         throw new Error('Claude 模式没有 MAX Mode');
       case 'params':
       case 'pickParam':
         throw new Error('Claude 模型参数请用电脑上的 Claude CLI 设置（或切模型）');
-      case 'newChat':
-        return c.newChat();
       case 'file':
         return this.openClaudeFile(String(msg.path ?? ''));
       case 'click':
@@ -1789,7 +2096,7 @@ class Session {
         if (msg.action === 'send') return c.sendQueuedNow(msg.id);
         throw new Error('不支持的排队操作');
       case 'stop':
-        return c.interrupt();
+        return this.stopClaudeTurn();
       case 'subagent':
       case 'mainChat':
         throw new Error('Claude 模式暂不支持子 Agent 切换');
@@ -1814,7 +2121,7 @@ class Session {
       case 'removeFile':
         throw new Error('Claude 模式暂只支持直接发图片；大文件请写进项目后用路径说明');
       case 'question':
-        return c.answerQuestion(msg.qi, msg.oi, ['option', 'submit', 'skip'].includes(msg.part) ? msg.part : 'option', msg.text);
+        return this.answerClaudeQuestion(msg);
       case 'changes': {
         const s = await c.listChanges();
         return this.emit({ t: 'changes', ...s });
@@ -1831,7 +2138,7 @@ class Session {
         return;
       case 'send': {
         const images = this.claudeImages.splice(0, this.claudeImages.length);
-        return c.sendMessage(String(msg.text ?? ''), { images, submit: msg.submit !== false });
+        return this.sendClaudeMessage(String(msg.text ?? ''), images, msg.submit !== false);
       }
       default:
         throw new Error(`未知指令: ${msg.t}`);
@@ -1875,10 +2182,17 @@ class Session {
       }));
       return this.emit({
         t: 'windows',
-        list: list.map(({ id, title, kind, sshHost }) => ({ id, title, sshHost: sshHost || '', kind: sshHost ? 'ssh' : kind })),
+        // In Claude mode one row is one Cursor window, with the folder it has open; its conversations are
+        // listed by the 历史 button. `sessions` is only a hint for the row's subtitle; a remote window's
+        // count would cost an ssh round trip just to draw the sheet, so it is left out there.
+        list: list.map(({ id, title, kind, sshHost, cwd, remote }) => {
+          const row = { id, title, sshHost: sshHost || '', kind: sshHost ? 'ssh' : kind, remote: Boolean(remote) };
+          if (CLAUDE_MODE && !remote) row.sessions = listClaudeHistory({ cwd }).length;
+          return row;
+        }),
         ssh,
         current: this.targetId,
-        hint: CLAUDE_MODE && !list.length ? '没有检测到正在运行的 Claude Code。在项目目录打开终端运行 claude，它会按所在目录出现在这里。' : '',
+        hint: CLAUDE_MODE && !list.length ? '这台电脑上没有打开的 Cursor 窗口。' : '',
       });
     }
     if (msg.t === 'openSsh') {
@@ -1969,6 +2283,12 @@ class Session {
       try {
         started = openTerminal(msg.cols, msg.rows, msg.session, String(msg.host || ''));
       } catch (e) {
+        // A Cursor panel conversation has no terminal here. Show it in the chat tab instead of leaving
+        // the phone on a terminal that will never start.
+        if (msg.session) {
+          this.emit({ t: 'status', ok: false, msg: e.message });
+          return this.attach(String(msg.session)).catch(() => {});
+        }
         return this.emit({ t: 'status', ok: false, msg: e.message });
       }
       this.emit({ t: 'term_hosts', hosts: [...REMOTES.keys()], current: String(msg.host || '') });
@@ -2054,6 +2374,7 @@ class Session {
     for (const item of this.ossStaged.values()) ossDel(item.key).catch(() => {});
     this.ossStaged.clear();
     clearInterval(this.idleTimer);
+    clearInterval(this.questionTimer);
     clearTimeout(this.ackTimer);
     claudeViewers.delete(this);
     terminalViewers.delete(this);

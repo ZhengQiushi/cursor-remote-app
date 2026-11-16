@@ -225,7 +225,7 @@ function listSessionFiles(cwd) {
       try { st = fs.statSync(full); } catch { return null; }
       const id = n.replace(/\.jsonl$/, '');
       const title = pinnedTopic(id, full) || id.slice(0, 8);
-      return { id, title, mtime: st.mtimeMs };
+      return { id, title, mtime: st.mtimeMs, file: full };
     })
     .filter(Boolean)
     .sort((a, b) => b.mtime - a.mtime);
@@ -976,6 +976,345 @@ export function transcriptPath(cwd, sessionId) {
   return path.join(os.homedir(), '.claude', 'projects', projectKey(cwd), `${sessionId}.jsonl`);
 }
 
+// The Cursor windows on this machine. Each window's Claude Code extension writes a lock file in
+// ~/.claude/ide/<port>.lock naming the folder that window has open, so one lock is one window. The port
+// is the extension's own websocket; a lock whose port is gone belongs to a window that has closed.
+const IDE_DIR = path.join(os.homedir(), '.claude', 'ide');
+
+// A Cursor window opened over SSH runs its Claude Code extension on the remote host, so its lock file and
+// transcripts live there, not here. These two run one ssh command on that host and parse its output;
+// ControlMaster keeps the connection warm, so a list costs well under a second after the first call.
+const SSH_MASTER = path.join(os.tmpdir(), 'cursor-remote-ssh-%r');
+
+function sshControlOptions() {
+  return ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', `ControlMaster=auto`,
+    '-o', `ControlPath=${SSH_MASTER}`, '-o', 'ControlPersist=600'];
+}
+
+// Runs one command on a remote host and returns its stdout. Never rejects: a host that is asleep or has
+// no such folder simply contributes nothing, the same way a closed window contributes nothing locally.
+export function sshRun(host, command, { timeout = 12_000 } = {}) {
+  return new Promise(resolve => {
+    if (!/^[A-Za-z0-9._-]+(@[A-Za-z0-9._-]+)?$/.test(String(host || ''))) return resolve('');
+    const child = spawn('ssh', [...sshControlOptions(), host, command], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    let settled = false;
+    const done = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(out); };
+    const timer = setTimeout(() => { try { child.kill(); } catch {} done(); }, timeout);
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', d => {
+      out += d;
+      // A transcript is capped here so one large conversation cannot stall the phone's list.
+      if (out.length > 8_000_000) { try { child.kill(); } catch {} done(); }
+    });
+    child.on('error', done);
+    child.on('close', done);
+  });
+}
+
+// Single-quote a string for a POSIX shell, so a message with quotes or $ in it arrives intact.
+function shellQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+// Writes base64-decoded bytes to a remote path. The payload goes over stdin, not the command line.
+function sshWrite(host, base64, remotePath) {
+  return new Promise(resolve => {
+    if (!/^[A-Za-z0-9+/=]+$/.test(String(base64 || ''))) return resolve(false);
+    const cmd = `mkdir -p ${shellQuote(path.posix.dirname(remotePath))} && base64 -d > ${shellQuote(remotePath)}`;
+    const child = spawn('ssh', [...sshControlOptions(), host, cmd], { stdio: ['pipe', 'ignore', 'ignore'] });
+    let settled = false;
+    const done = ok => { if (settled) return; settled = true; clearTimeout(timer); resolve(ok); };
+    const timer = setTimeout(() => { try { child.kill(); } catch {} done(false); }, 30_000);
+    child.on('error', () => done(false));
+    child.on('close', code => done(code === 0));
+    child.stdin.on('error', () => {});
+    child.stdin.end(String(base64));
+  });
+}
+
+// The Cursor windows open on a remote host (where a Cursor SSH window's extension lives).
+export async function listRemoteCursorWindows(host) {
+  const out = await sshRun(host, 'for f in ~/.claude/ide/*.lock; do echo "@@$f"; cat "$f"; echo; done');
+  const rows = [];
+  for (const chunk of out.split('@@').slice(1)) {
+    const nl = chunk.indexOf('\n');
+    if (nl < 0) continue;
+    const file = chunk.slice(0, nl).trim();
+    let lock;
+    try { lock = JSON.parse(chunk.slice(nl + 1).trim()); } catch { continue; }
+    if (!lock || lock.ideName !== 'Cursor') continue;
+    const folders = Array.isArray(lock.workspaceFolders) ? lock.workspaceFolders.filter(Boolean) : [];
+    if (!folders.length) continue;
+    const port = Number(path.basename(file).replace(/\.lock$/, ''));
+    rows.push({
+      id: `ssh:${host}:${port}`,
+      port,
+      host,
+      pid: lock.pid || 0,
+      folders,
+      cwd: folders[0],
+      name: path.basename(folders[0]) || folders[0],
+      remote: true,
+    });
+  }
+  // A reopened folder can leave two locks behind; the same folder is one window.
+  const byFolder = new Map();
+  for (const row of rows) byFolder.set(row.cwd, row);
+  return [...byFolder.values()];
+}
+
+// The conversations a remote window's folder has: live ones from ~/.claude/sessions, then the transcripts
+// on disk. The shape matches listClaudeClients/ listClaudeHistory so the phone cannot tell them apart.
+export async function listRemoteClaudeHistory(host, cwd) {
+  const dirKey = String(cwd || '').replace(/[\\/]/g, '-');
+  const cmd = [
+    'echo "@@SESSIONS"',
+    'for f in ~/.claude/sessions/*.json; do [ -f "$f" ] && cat "$f" && echo; done 2>/dev/null',
+    'echo "@@TRANSCRIPTS"',
+    `for f in ~/.claude/projects/${dirKey}/*.jsonl; do [ -f "$f" ] && stat -c '%n %s %Y' "$f"; done 2>/dev/null`,
+    'echo "@@KEYS"',
+    'for f in ~/.claude/sessions/*.key; do [ -f "$f" ] && echo "$f $(cat "$f")" && echo; done 2>/dev/null',
+    // The topic is the first thing the person typed; only the head of each transcript is read for it.
+    'echo "@@TOPICS"',
+    `for f in ~/.claude/projects/${dirKey}/*.jsonl; do [ -f "$f" ] && echo "$f" && head -c 4000 "$f" | grep -a '"type":"user"' | head -1; done 2>/dev/null`,
+  ].join('; ');
+  const out = await sshRun(host, cmd);
+  const part = name => {
+    const start = out.indexOf(`@@${name}`);
+    if (start < 0) return '';
+    const end = out.indexOf('@@', start + 2);
+    return out.slice(start + name.length + 2, end < 0 ? undefined : end).trim();
+  };
+  const alive = new Set();
+  const waiting = new Map();
+  for (const line of part('SESSIONS').split('\n')) {
+    if (!line.trim()) continue;
+    let meta;
+    try { meta = JSON.parse(line); } catch { continue; }
+    if (!meta?.sessionId) continue;
+    // The remote lock is the only liveness signal worth trusting; a pid there means nothing here.
+    alive.add(meta.sessionId);
+    waiting.set(meta.sessionId, { meta });
+  }
+  const rows = [];
+  const seen = new Set();
+  const sockets = new Map();
+  for (const line of part('KEYS').split('\n')) {
+    const m = /^(\S+)\s+(\{.*\})$/.exec(line.trim());
+    if (!m) continue;
+    try {
+      const d = JSON.parse(m[2]);
+      const pid = Number(path.basename(m[1]).split('.')[0]);
+      sockets.set(pid, { keyFile: m[1], peerToken: d.peerToken || '' });
+    } catch {}
+  }
+  for (const [id, { meta }] of waiting) {
+    if (meta.cwd && cwd && meta.cwd !== cwd) continue;
+    if (meta.entrypoint === 'claude-remote-lite') continue;
+    seen.add(id);
+    const sock = meta.messagingSocketPath || '';
+    const token = sockets.get(meta.pid)?.peerToken || '';
+    rows.push({
+      id,
+      pid: meta.pid || 0,
+      host,
+      cwd: meta.cwd || cwd,
+      base: path.basename(meta.cwd || cwd) || host,
+      // The topic comes from the remote transcript, which costs a round trip; the caller fills it in only
+      // when it needs names (the history list), and the cache keeps repeat reads from paying twice.
+      name: '',
+      status: meta.status || 'idle',
+      waitingFor: meta.waitingFor || '',
+      socket: sock,
+      peerToken: token,
+      startedAt: meta.startedAt || 0,
+      source: meta.entrypoint || '',
+      live: true,
+      remote: true,
+      inCursor: meta.entrypoint === 'claude-vscode',
+      // Absolute path on the remote host, used to fetch the transcript over the same ssh connection.
+      file: `${dirKey}/${id}.jsonl`,
+    });
+  }
+  // Topics are keyed by transcript path; apply them to both live and closed rows.
+  const topicOf = new Map();
+  {
+    const raw = part('TOPICS');
+    for (const chunk of raw.split(/(?=^\/[^\n]*\.jsonl$)/m)) {
+      const nl = chunk.indexOf('\n');
+      if (nl < 0) continue;
+      const file = chunk.slice(0, nl).trim();
+      if (!/\.jsonl$/.test(file)) continue;
+      const id = path.basename(file).replace(/\.jsonl$/, '');
+      let topic = '';
+      try {
+        const row = JSON.parse(chunk.slice(nl + 1).trim());
+        const content = row?.message?.content;
+        const text = typeof content === 'string' ? content
+          : Array.isArray(content) ? (content.find(c => c?.type === 'text')?.text || '') : '';
+        const clean = String(text || '').trim().replace(/\s+/g, ' ');
+        if (clean && !clean.startsWith('<') && !clean.startsWith('[Request interrupted')) {
+          topic = clean.replace(/\b(sk|pk|ghp|xox[bp])[-_][A-Za-z0-9_-]{8,}/g, '[密钥已隐藏]').slice(0, 60);
+        }
+      } catch {}
+      topicOf.set(id, topic);
+    }
+  }
+  for (const row of rows) {
+    const topic = topicOf.get(row.id) || '';
+    row.name = topic || row.id.slice(0, 8);
+    row.title = `${row.cwd || row.name} — ${row.base || ''} · ${row.name}`;
+  }
+  for (const line of part('TRANSCRIPTS').split('\n')) {
+    const m = /^(\S+)\s+(\d+)\s+(\d+)$/.exec(line.trim());
+    if (!m) continue;
+    const file = m[1];
+    const mtime = Number(m[3]) * 1000;
+    const id = path.basename(file).replace(/\.jsonl$/, '');
+    if (!/^[0-9a-f-]{36}$/i.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    rows.push({
+      id, pid: 0, host, cwd, base: path.basename(cwd) || host,
+      name: '', status: 'closed', waitingFor: '', socket: '', peerToken: '',
+      startedAt: mtime, source: '', live: false, remote: true, inCursor: false,
+      file,
+    });
+  }
+  return rows;
+}
+
+// Cursor's own record of the windows that are open right now, updated as windows are opened and closed.
+// This is the source for the phone's window list: it knows about SSH windows too, whose files live on the
+// remote host and whose IDE lock is never written here.
+const CURSOR_STORAGE = process.platform === 'darwin'
+  ? path.join(os.homedir(), 'Library', 'Application Support', 'Cursor', 'User', 'globalStorage', 'storage.json')
+  : process.platform === 'win32'
+    ? path.join(process.env.APPDATA || '', 'Cursor', 'User', 'globalStorage', 'storage.json')
+    : path.join(os.homedir(), '.config', 'Cursor', 'User', 'globalStorage', 'storage.json');
+
+function cursorStorage() {
+  try { return JSON.parse(fs.readFileSync(CURSOR_STORAGE, 'utf8')); } catch { return null; }
+}
+
+// "file:///Users/me/p" → { host: null, root }, "vscode-remote://ssh-remote+<hex>/home/x" → { host, root }.
+function parseWindowFolder(uri) {
+  try {
+    const u = new URL(uri);
+    const root = decodeURIComponent(u.pathname).replace(/\/$/, '') || '/';
+    if (u.protocol === 'file:') return { host: null, root };
+    if (u.protocol !== 'vscode-remote:') return null;
+    const auth = decodeURIComponent(u.host);
+    const m = /^ssh-remote\+(.+)$/.exec(auth);
+    if (!m) return null;
+    let host = m[1];
+    if (/^[0-9a-f]+$/i.test(host) && host.length % 2 === 0) {
+      try { host = JSON.parse(Buffer.from(host, 'hex').toString('utf8')).hostName || host; } catch {}
+    }
+    return { host, root };
+  } catch { return null; }
+}
+
+// Cursor writes its open windows to storage.json, but only when it gets around to it: right after a
+// restart the list can still be empty while windows are plainly open. The Claude Code extension's IDE
+// lock in each window is written as soon as that window loads, so both are merged. A lock only exists
+// for windows with the extension's panel open, and storage.json is the only source for SSH windows, so
+// neither alone is enough.
+function localWindowLocks() {
+  let names = [];
+  try { names = fs.readdirSync(IDE_DIR).filter(n => n.endsWith('.lock')); } catch { return []; }
+  const rows = [];
+  for (const name of names) {
+    let lock;
+    try { lock = JSON.parse(fs.readFileSync(path.join(IDE_DIR, name), 'utf8')); } catch { continue; }
+    // A lock left behind by Cursor before a restart names a pid that is gone.
+    if (!lock || lock.ideName !== 'Cursor') continue;
+    if (lock.pid && !pidAlive(lock.pid)) continue;
+    const folders = Array.isArray(lock.workspaceFolders) ? lock.workspaceFolders.filter(Boolean) : [];
+    if (!folders.length) continue;
+    rows.push({ cwd: folders[0], pid: lock.pid || 0 });
+  }
+  return rows;
+}
+
+export function listCursorWindows() {
+  const store = cursorStorage();
+  const open = Array.isArray(store?.windowsState?.openedWindows) ? store.windowsState.openedWindows : [];
+  const active = store?.windowsState?.lastActiveWindow?.folder || '';
+  const rows = [];
+  const seen = new Set();
+  const add = (uri, extra = {}) => {
+    const parsed = parseWindowFolder(uri);
+    if (!parsed || !parsed.root) return;
+    const key = `${parsed.host || ''}\0${parsed.root}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    rows.push({
+      id: parsed.host ? `ssh:${parsed.host}:${parsed.root}` : `local:${parsed.root}`,
+      host: parsed.host || '',
+      cwd: parsed.root,
+      name: path.basename(parsed.root) || parsed.root,
+      remote: Boolean(parsed.host),
+      active: uri === active,
+      ...extra,
+    });
+  };
+  for (const w of open) add(String(w?.folder || ''));
+  for (const lock of localWindowLocks()) add(`file://${lock.cwd}`);
+  // A window whose folder is open but that Cursor has not recorded is still a window; it goes first only
+  // when nothing is marked active, so the sheet keeps a stable order.
+  return rows.sort((a, b) => (b.active - a.active) || (a.name || '').localeCompare(b.name || ''));
+}
+
+// A transcript's folder name is the cwd with every / turned into -, which cannot be reversed (a project
+// folder can itself contain a dash), so the cwd comes from a row that carries one. The entrypoint says how
+// the conversation was driven: a Cursor window's Claude Code panel (claude-vscode), a terminal CLI (cli),
+// a script (sdk-cli), or a process this relay started (claude-remote-lite, never listed). A conversation
+// resumed elsewhere keeps its old rows, so the head is read first and only fallen back to for the rest.
+// Both are cached per file until it changes.
+const transcriptHeads = new Map(); // file -> { stamp, size, cwd, source }
+function transcriptMeta(file, st) {
+  const stamp = st?.mtimeMs || 0;
+  const size = st?.size || 0;
+  const hit = transcriptHeads.get(file);
+  if (hit && hit.stamp === stamp && hit.size === size) return hit;
+  let cwd = '';
+  let source = '';
+  let raw = '';
+  try { raw = fs.readFileSync(file, 'utf8'); } catch {}
+  const lines = raw ? raw.split('\n') : [];
+  const blocks = [lines.slice(0, 200).join('\n')];
+  // A resumed conversation can be long; look near the end too, but never the whole file.
+  if (lines.length > 200) blocks.push(lines.slice(Math.max(200, lines.length - 200)).join('\n'));
+  for (const block of blocks) {
+    if (!cwd && block.includes('"cwd"')) {
+      for (const line of block.split('\n')) {
+        try {
+          const row = JSON.parse(line);
+          if (row?.cwd) { cwd = String(row.cwd); break; }
+        } catch {}
+      }
+    }
+    if (!source) {
+      const found = [...block.matchAll(/"entrypoint":"([^"]+)"/g)].map(m => m[1]);
+      if (found.length) source = found[found.length - 1];
+    }
+  }
+  const meta = { stamp, size, cwd, source };
+  transcriptHeads.set(file, meta);
+  // The map holds one entry per conversation; trim it when a long-lived relay accumulates many.
+  if (transcriptHeads.size > 500) {
+    for (const key of [...transcriptHeads.keys()].slice(0, 200)) transcriptHeads.delete(key);
+  }
+  return meta;
+}
+
+function sourceOfTranscript(file) {
+  let st;
+  try { st = fs.statSync(file); } catch { return ''; }
+  return transcriptMeta(file, st).source;
+}
+
 function peerTokenFor(pid, socketPath) {
   if (!socketPath) return '';
   const hash = crypto.createHash('sha256').update(socketPath).digest('hex');
@@ -1012,6 +1351,39 @@ function postInbox(socketPath, token, text) {
   });
 }
 
+// Every conversation this machine has a transcript for, live or closed, newest first. A folder is taken
+// from the transcript's own `cwd`; transcripts a relay started are left out because they are not the
+// person's own windows. Closed ones are read-only: the phone can read them, and asking Cursor to reopen
+// one puts it back in the panel it came from.
+export function listClaudeSessions({ limit = 60 } = {}) {
+  const projects = path.join(os.homedir(), '.claude', 'projects');
+  let dirs = [];
+  try { dirs = fs.readdirSync(projects); } catch { return []; }
+  const rows = [];
+  for (const dir of dirs) {
+    const full = path.join(projects, dir);
+    let names = [];
+    try {
+      if (!fs.statSync(full).isDirectory()) continue;
+      names = fs.readdirSync(full).filter(n => n.endsWith('.jsonl'));
+    } catch { continue; }
+    for (const name of names) {
+      const file = path.join(full, name);
+      let st;
+      try { st = fs.statSync(file); } catch { continue; }
+      if (st.size < 32) continue;
+      const id = name.replace(/\.jsonl$/, '');
+      if (!/^[0-9a-f-]{36}$/i.test(id)) continue;
+      const meta = transcriptMeta(file, st);
+      // A relay of its own started this one; it is not a window the person opened.
+      if (meta.source === 'claude-remote-lite') continue;
+      rows.push({ id, cwd: meta.cwd, source: meta.source, mtime: st.mtimeMs, file });
+    }
+  }
+  rows.sort((a, b) => b.mtime - a.mtime);
+  return rows.slice(0, limit);
+}
+
 // Live Claude Code processes on this machine, one row per terminal / client.
 export function listClaudeClients() {
   const rows = [];
@@ -1021,7 +1393,8 @@ export function listClaudeClients() {
     if (meta.messagingSocketPath && !fs.existsSync(meta.messagingSocketPath)) continue;
     const cwd = meta.cwd || '';
     const base = path.basename(cwd) || meta.name || `claude-${meta.pid}`;
-    const topic = pinnedTopic(meta.sessionId, transcriptPath(cwd, meta.sessionId));
+    const file = transcriptPath(cwd, meta.sessionId);
+    const topic = pinnedTopic(meta.sessionId, file);
     rows.push({
       id: meta.sessionId,
       pid: meta.pid,
@@ -1032,6 +1405,9 @@ export function listClaudeClients() {
       waitingFor: meta.waitingFor || '',
       socket: meta.messagingSocketPath || '',
       startedAt: meta.startedAt || 0,
+      source: meta.entrypoint || sourceOfTranscript(file),
+      live: true,
+      inCursor: meta.entrypoint === 'claude-vscode',
     });
   }
   // One conversation can have two live processes (an old one left running and a newer resume). Show it
@@ -1054,6 +1430,76 @@ export function listClaudeClients() {
   return rows;
 }
 
+// A remote host costs a slow round trip per call, so a window's conversations are cached briefly. The
+// list is what the 历史 button asks for, not a live feed, so a few seconds stale is fine and keeps the
+// button feeling instant; a miss or an expired entry re-reads the host.
+const remoteHistoryCache = new Map(); // "host\0cwd" -> { at, rows }
+const REMOTE_HISTORY_TTL = 5000;
+
+export async function remoteClaudeHistory(host, cwd) {
+  const key = `${host}\0${cwd}`;
+  const hit = remoteHistoryCache.get(key);
+  if (hit && Date.now() - hit.at < REMOTE_HISTORY_TTL) return hit.rows;
+  // A fetch that overlaps another keeps the older answer instead of piling up ssh sessions.
+  const rows = await listRemoteClaudeHistory(host, cwd).catch(() => hit?.rows || []);
+  remoteHistoryCache.set(key, { at: Date.now(), rows });
+  return rows;
+}
+
+// The conversations of one Cursor window: every live process there, then the ones that are no longer
+// running, newest first. Passing no window lists the whole machine, which only the relay's own health
+// line uses; the phone always asks for one window at a time.
+export function listClaudeHistory({ cwd = '', onlyCursor = false } = {}) {
+  const live = listClaudeClients().filter(r => !cwd || !r.cwd || r.cwd === cwd);
+  const seen = new Set(live.map(r => r.id));
+  const closed = [];
+  for (const s of listClaudeSessions({ limit: 200 })) {
+    if (seen.has(s.id)) continue;
+    if (cwd && s.cwd !== cwd) continue;
+    if (onlyCursor && s.source !== 'claude-vscode') continue;
+    const base = path.basename(s.cwd) || 'claude';
+    const topic = pinnedTopic(s.id, s.file) || s.id.slice(0, 8);
+    closed.push({
+      id: s.id,
+      pid: 0,
+      cwd: s.cwd,
+      base,
+      name: topic,
+      status: 'closed',
+      waitingFor: '',
+      socket: '',
+      startedAt: s.mtime,
+      source: s.source,
+      live: false,
+      inCursor: s.source === 'claude-vscode',
+      file: s.file,
+      kind: 'claude',
+      title: `${s.cwd || topic} — ${base} · ${topic}`,
+    });
+  }
+  const rows = [...live, ...closed];
+  return labelHistory(rows);
+}
+
+// Kept separate so the remote list goes through exactly the same naming rules.
+export function labelHistory(rows) {
+  // Two conversations often start with the same words ("hi"); the history list shows only the topic, so
+  // repeated names get a time suffix that tells them apart.
+  const counts = new Map();
+  for (const r of rows) counts.set(r.name, (counts.get(r.name) || 0) + 1);
+  const when = t => {
+    const d = new Date(t);
+    if (!Number.isFinite(d.getTime())) return '';
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  for (const r of rows) {
+    r.when = when(r.startedAt);
+    if ((counts.get(r.name) || 0) > 1 && r.when) r.name = `${r.name} · ${r.when}`;
+  }
+  return rows;
+}
+
 export function stopRelayOwnedSessions() {
   for (const meta of readSessionFiles()) {
     if (meta.entrypoint !== 'claude-remote-lite') continue;
@@ -1066,11 +1512,15 @@ const inboxes = new Map();
 
 export function inboxFor(client, onUpdate) {
   let box = inboxes.get(client.id);
-  if (box) {
+  // The closed reader and a live process share a conversation id but not a channel: when the process
+  // appears, it replaces the closed one rather than borrowing its empty socket and pid.
+  const stale = box && (box.closed !== (client.live === false));
+  if (box && !stale) {
     box.onUpdate = onUpdate || box.onUpdate;
     box.meta = { ...box.meta, ...client };
     return box;
   }
+  if (stale) dropInbox(client.id);
   box = new ClaudeInbox(client, onUpdate);
   inboxes.set(client.id, box);
   box.start();
@@ -1110,16 +1560,64 @@ export class ClaudeInbox {
     this.busy = false;
     this.waitingFor = '';
     this.alive = true;
+    // A conversation with no live process is still readable from its transcript; it just cannot be typed into.
+    this.closed = !meta.pid || meta.live === false;
+    // The Agent's pending question, read from the Cursor panel's own DOM (the transcript does not carry it).
+    this.question = null;
     this.lastRaw = null;
+    this.lastStamp = 0;
     this.lastSnap = '';
     this.timer = null;
   }
 
+  // The relay fills this in after reading the panel; it is what makes the question card show on the phone.
+  setQuestion(q) {
+    this.question = q || null;
+    this.publish();
+  }
+
+  // A distinctive line from this conversation, used to check that a Cursor panel is really showing it
+  // before the relay types there. The first human turn is used rather than the last: a panel can keep an
+  // older conversation's tail in the DOM, but a conversation's opening request is what its own page shows
+  // from the top, and short pings ("hi", "OK") appear in many conversations and would match the wrong one.
+  confirmText() {
+    for (const it of this.items) {
+      if (it.k !== 'human') continue;
+      const t = String(it.t || '').replace(/\s+/g, ' ').trim();
+      if (t.length >= 12) return t.slice(0, 80);
+    }
+    // A conversation whose every turn is a short ping can only be checked loosely.
+    for (const it of this.items) {
+      if (it.k === 'human' && it.t) return String(it.t).replace(/\s+/g, ' ').trim().slice(0, 80);
+    }
+    return '';
+  }
+
   get cwd() { return this.meta.cwd || process.cwd(); }
+
+  // A Cursor window's Claude panel is a conversation of its own: it is driven through its peer socket,
+  // never by resuming it in a second process.
+  get inCursor() { return this.meta.inCursor === true || this.meta.source === 'claude-vscode'; }
+
+  // The transcript for this conversation: the one the list found, or the usual place by folder + id.
+  get file() { return this.meta.file || transcriptPath(this.meta.cwd, this.meta.id); }
+
+  // A conversation whose Claude Code runs on a remote host (an SSH window). Its transcript and peer
+  // socket are there, so both reading and posting go over ssh instead of the local filesystem.
+  get remote() { return Boolean(this.meta.remote && this.meta.host); }
 
   start() {
     this.load();
+    // A remote conversation is not polled: one read on attach, and a fresh one when the phone asks for it.
+    if (this.remote) return;
     this.timer = setInterval(() => this.load(), 800);
+  }
+
+  // Re-reads a remote transcript after a message was sent, or when the phone pulls to refresh.
+  refresh() {
+    if (this.remote) { this.lastStamp = 0; return this.loadRemote({ force: true }); }
+    this.lastStamp = 0;
+    return this.load();
   }
 
   stop() {
@@ -1127,7 +1625,19 @@ export class ClaudeInbox {
     this.timer = null;
   }
 
+  // load() reads the conversation twice a second; the mtime check keeps a big transcript from being
+  // re-read and re-parsed when nothing has been appended.
+  mtime() {
+    try { return fs.statSync(this.file).mtimeMs; } catch { return 0; }
+  }
+
   refreshMeta() {
+    if (this.closed) {
+      // No process to watch: it is closed until Cursor (or a terminal) opens it again.
+      this.alive = false;
+      this.busy = false;
+      return;
+    }
     const file = path.join(SESSIONS_DIR, `${this.meta.pid}.json`);
     try {
       const meta = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -1148,10 +1658,14 @@ export class ClaudeInbox {
   }
 
   load() {
-    this.refreshMeta();
-    const file = transcriptPath(this.meta.cwd, this.meta.id);
+    if (this.remote) return this.loadRemote();
+    if (this.closed) this.alive = false;
+    else this.refreshMeta();
+    const stamp = this.mtime();
+    if (stamp && stamp === this.lastStamp) { this.publish(); return; }
+    this.lastStamp = stamp;
     let raw = '';
-    try { raw = fs.readFileSync(file, 'utf8'); } catch { raw = ''; }
+    try { raw = fs.readFileSync(this.file, 'utf8'); } catch { raw = ''; }
     if (raw !== this.lastRaw) {
       this.lastRaw = raw;
       this.items = parseTranscript(raw, this.cwd);
@@ -1159,6 +1673,38 @@ export class ClaudeInbox {
       if (parseTranscript.model) this.model = parseTranscript.model;
     }
     this.publish();
+  }
+
+  // A remote transcript is read once and then only when the phone asks again. The link to an SSH host can
+  // be slow (tens of KB/s on a bad day), so polling it on a timer would spend the whole connection
+  // transferring the same tail; the transcript on that host only changes while its Claude is running, and
+  // a running turn is visible from the session's status without reading the file.
+  loadRemote({ force = false } = {}) {
+    if (this.loading) return;
+    if (!force && this.lastStamp) return;
+    this.loading = true;
+    const dirKey = String(this.cwd || '').replace(/[\\/]/g, '-');
+    const rel = `~/.claude/projects/${dirKey}/${this.meta.id}.jsonl`;
+    // Last 60 KB is a few hundred turns; `tail` can cut the first line, which the parser skips.
+    const cmd = `stat -c %Y ${rel} 2>/dev/null; echo '@@'; tail -c 60000 ${rel} 2>/dev/null`;
+    sshRun(this.meta.host, cmd, { timeout: 45_000 }).then(out => {
+      this.loading = false;
+      const cut = out.indexOf('@@');
+      const stamp = Number(out.slice(0, Math.max(0, cut)).trim()) * 1000 || 0;
+      const raw = cut < 0 ? '' : out.slice(cut + 2);
+      this.alive = Boolean(this.meta.live);
+      this.busy = this.alive && this.meta.status && this.meta.status !== 'idle';
+      this.waitingFor = this.meta.waitingFor || '';
+      if (stamp && stamp === this.lastStamp) { this.publish(); return; }
+      this.lastStamp = stamp;
+      if (raw && raw !== this.lastRaw) {
+        this.lastRaw = raw;
+        this.items = parseTranscript(raw, this.cwd);
+        if (parseTranscript.mode) this.permissionMode = parseTranscript.mode;
+        if (parseTranscript.model) this.model = parseTranscript.model;
+      }
+      this.publish();
+    }).catch(() => { this.loading = false; this.publish(); });
   }
 
   publish() {
@@ -1171,8 +1717,13 @@ export class ClaudeInbox {
 
   snapshot() {
     const items = this.items.slice(-200);
-    if (!this.alive) items.push({ i: 'gone', k: 'other', t: '这个 Claude 已经退出' });
+    const where = this.inCursor ? 'Cursor 窗口' : '终端';
+    if (this.closed) items.push({ i: 'gone', k: 'other', t: `这段会话已经关闭，正在看它的历史。点「在 Cursor 里打开」可以让它继续。` });
+    else if (!this.alive) items.push({ i: 'gone', k: 'other', t: `这个 Claude 已经退出（原来的${where}）` });
     else if (this.waitingFor) items.push({ i: 'wait', k: 'other', t: `终端正在等待：${this.waitingFor}` });
+    // A question the Agent is asking is put in the shape the phone's question card already understands,
+    // so it can be answered from the phone instead of only at the computer.
+    const asked = this.question;
     return {
       rect: null,
       items,
@@ -1181,8 +1732,18 @@ export class ClaudeInbox {
       queued: [],
       subagents: [],
       changed: 0,
-      questions: null,
-      readonly: !this.alive,
+      questions: asked ? {
+        list: [{
+          text: asked.text || 'Agent 在问你',
+          options: (asked.options || []).map(o => ({ label: o.label, sel: Boolean(o.selected), free: false })),
+        }],
+        canSubmit: Boolean(asked.canSubmit),
+      } : null,
+      // A closed conversation is read-only until it is reopened; a live one takes keys as usual.
+      readonly: this.closed || !this.alive,
+      // The phone tells the two read-only cases apart without matching on the notice text.
+      closed: this.closed,
+      where,
       mode: PERM_LABEL[this.permissionMode] || this.permissionMode || 'Claude',
       model: this.model || 'Claude',
     };
@@ -1190,6 +1751,8 @@ export class ClaudeInbox {
 
   async sendMessage(text, { images = [], submit = true } = {}) {
     if (!submit) return false;
+    if (this.remote) return this.sendRemote(String(text || '').trim(), images);
+    if (this.closed) throw new Error('这个会话已经关闭。点上面的「在 Cursor 里打开」，等它跑起来再发');
     if (!this.alive) throw new Error('这个 Claude 已经退出，请重新打开列表');
     const socket = this.meta.socket;
     if (!socket || !fs.existsSync(socket)) throw new Error('这个 Claude 的终端已经不在了');
@@ -1209,6 +1772,44 @@ export class ClaudeInbox {
     const token = peerTokenFor(this.meta.pid, socket);
     await postInbox(socket, token, body);
     setTimeout(() => this.load(), 400);
+    return false;
+  }
+
+  // A remote conversation takes its message through its own peer socket on that host. Images are written
+  // to the remote project's temp/ first, so the path in the message means something there.
+  async sendRemote(text, images = []) {
+    if (this.closed) throw new Error('这个会话已经关闭。先在 Cursor 窗口里打开它');
+    if (!this.alive) throw new Error('这个 Claude 已经退出，请重新打开列表');
+    const socket = this.meta.socket;
+    if (!socket) throw new Error('这个 Claude 没有可用的消息通道');
+    let body = text;
+    const notes = [];
+    for (const img of images) {
+      if (!img?.data || !img?.type) continue;
+      const ext = img.type === 'image/png' ? 'png' : img.type === 'image/gif' ? 'gif' : img.type === 'image/webp' ? 'webp' : 'jpg';
+      const rel = `temp/phone-${Date.now()}-${crypto.randomBytes(2).toString('hex')}.${ext}`;
+      // base64 through ssh's stdin keeps the payload off the command line, where it would be too long.
+      const wrote = await sshWrite(this.meta.host, img.data, `${this.cwd}/${rel}`);
+      if (wrote) notes.push(rel);
+    }
+    if (notes.length) body = `${notes.join('\n')}${body ? `\n${body}` : ''}`;
+    if (!body) throw new Error('内容不能为空');
+    const line = JSON.stringify({
+      type: 'auth',
+      token: this.meta.peerToken || '',
+    });
+    const msg = JSON.stringify({
+      msgV: 1,
+      msg_id: `cc-msg-${crypto.randomBytes(16).toString('hex')}`,
+      type: 'user',
+      message: { role: 'user', content: body },
+      priority: 'now',
+    });
+    // Sending is one round trip: feed both lines to the socket on the host, then close it.
+    const cmd = `printf '%s\\n%s\\n' ${shellQuote(line)} ${shellQuote(msg)} | nc -U -w5 ${shellQuote(socket)}`;
+    const out = await sshRun(this.meta.host, cmd, { timeout: 15_000 });
+    if (out === null) throw new Error('发到远程电脑失败');
+    setTimeout(() => this.refresh(), 1200);
     return false;
   }
 
