@@ -141,8 +141,10 @@ for (const r of Array.isArray(CONFIG.remoteTerminals) ? CONFIG.remoteTerminals :
 
 function remoteArgv(remote) {
   // BatchMode: a password or host-key question would otherwise wait on a prompt nobody can see.
+  // A non-interactive ssh shell does not read the profile, so the npm global bin is put on PATH here.
+  // The remote computer's own Claude runs with every permission granted (bypass), as configured for it.
   return ['ssh', '-tt', '-o', 'BatchMode=yes', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
-    remote.host, `cd ${remote.cwd} && exec claude`];
+    remote.host, `cd ${remote.cwd} && export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH" && exec claude --dangerously-skip-permissions`];
 }
 
 function openTerminal(cols, rows, session, host = '') {
