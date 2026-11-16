@@ -1731,9 +1731,17 @@ class Session {
         const items = await c.openMenu(msg.kind);
         return this.emit({ t: 'menu', kind: msg.kind, items, max: null });
       }
-      case 'pickMenu':
+      case 'pickMenu': {
+        // On the terminal tab, a picked conversation becomes the terminal on screen (its own terminal, resumed).
+        if (this.mode === 'term' && msg.kind === 'history') {
+          const rows = c.historyMenu();
+          const hit = rows.find(r => r.label === msg.label) || rows.find(r => r.id === msg.label);
+          if (!hit) throw new Error('找不到这段历史对话');
+          return this.emit({ t: 'attached', id: hit.id, title: hit.label, sshHost: '' });
+        }
         await c.pickMenu(msg.kind, msg.label);
         return this.emit({ t: 'status', ok: true, msg: '已发送到终端' });
+      }
       case 'toggleMax':
         throw new Error('Claude 模式没有 MAX Mode');
       case 'params':

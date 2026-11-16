@@ -1487,7 +1487,8 @@ function termRenderCards() {
 }
 
 // Shortcuts for the chat's buttons: typed into Claude Code, which runs the same commands.
-$('termHistory').onclick = () => termKeyText('/resume\r');
+// 历史 opens the phone's own list (with each conversation's topic), not Claude Code's bare-id picker.
+$('termHistory').onclick = () => { status('读取历史对话…'); send({ t: 'openMenu', kind: 'history' }); };
 $('termModel').onclick = () => termKeyText('/model\r');
 $('termMode').onclick = () => termKeyText('\x1b[Z');
 function termKeyText(data) {

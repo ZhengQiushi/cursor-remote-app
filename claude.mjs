@@ -169,8 +169,29 @@ function toolFile(name, input) {
 }
 
 function projectDirKey(cwd) {
-  // Claude stores transcripts under ~/.claude/projects/<cwd with / → ->
-  return cwd.replace(/^\//, '').replace(/[\\/]/g, '-');
+  // Claude stores transcripts under ~/.claude/projects/<cwd with every / → ->, so the leading slash
+  // becomes the folder's leading dash (-Users-lion-...). Dropping it finds no folder at all.
+  return cwd.replace(/[\\/]/g, '-');
+}
+
+// The conversation's topic: the first thing the person typed, read from its transcript. Claude Code's
+// derived name (ai-tutor-web-96) is only a counter, and command lines (/model) are not topics.
+export function topicOf(file) {
+  let head;
+  try { head = fs.readFileSync(file, 'utf8').split('\n').slice(0, 400); } catch { return ''; }
+  for (const line of head) {
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (row?.type !== 'user' || row.isMeta) continue;
+    const content = row.message?.content;
+    const text = typeof content === 'string'
+      ? content
+      : (Array.isArray(content) ? content.find(c => c?.type === 'text')?.text : '');
+    const clean = String(text || '').trim();
+    if (!clean || clean.startsWith('<') || clean.startsWith('[Request interrupted')) continue; // wrappers, not the person's ask
+    return clean.replace(/\s+/g, ' ').slice(0, 60);
+  }
+  return '';
 }
 
 function listSessionFiles(cwd) {
@@ -183,26 +204,7 @@ function listSessionFiles(cwd) {
       let st;
       try { st = fs.statSync(full); } catch { return null; }
       const id = n.replace(/\.jsonl$/, '');
-      let title = id.slice(0, 8);
-      try {
-        const head = fs.readFileSync(full, 'utf8').split('\n').slice(0, 40);
-        for (const line of head) {
-          try {
-            const row = JSON.parse(line);
-            const text = row?.message?.content
-              || row?.content
-              || (Array.isArray(row?.message?.content) ? row.message.content.find(c => c.type === 'text')?.text : null);
-            if (typeof text === 'string' && text.trim()) {
-              title = text.trim().replace(/\s+/g, ' ').slice(0, 60);
-              break;
-            }
-            if (row?.type === 'user' && typeof row?.message?.content === 'string') {
-              title = row.message.content.trim().replace(/\s+/g, ' ').slice(0, 60);
-              break;
-            }
-          } catch {}
-        }
-      } catch {}
+      const title = topicOf(full) || id.slice(0, 8);
       return { id, title, mtime: st.mtimeMs };
     })
     .filter(Boolean)
@@ -999,12 +1001,13 @@ export function listClaudeClients() {
     if (meta.messagingSocketPath && !fs.existsSync(meta.messagingSocketPath)) continue;
     const cwd = meta.cwd || '';
     const base = path.basename(cwd) || meta.name || `claude-${meta.pid}`;
+    const topic = topicOf(transcriptPath(cwd, meta.sessionId));
     rows.push({
       id: meta.sessionId,
       pid: meta.pid,
       cwd,
       base,
-      name: meta.name || base,
+      name: topic || (meta.nameSource === 'derived' ? '' : meta.name) || base,
       status: meta.status || 'idle',
       waitingFor: meta.waitingFor || '',
       socket: meta.messagingSocketPath || '',
