@@ -1034,6 +1034,14 @@ export function listClaudeClients() {
       startedAt: meta.startedAt || 0,
     });
   }
+  // One conversation can have two live processes (an old one left running and a newer resume). Show it
+  // once, as the newest, so the list never marks two rows as the current one.
+  const newest = new Map();
+  for (const row of rows) {
+    const seen = newest.get(row.id);
+    if (!seen || row.startedAt > seen.startedAt) newest.set(row.id, row);
+  }
+  rows.splice(0, rows.length, ...newest.values());
   const bases = new Map();
   for (const row of rows) bases.set(row.base, (bases.get(row.base) || 0) + 1);
   for (const row of rows) {
