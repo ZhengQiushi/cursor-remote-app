@@ -807,6 +807,8 @@ function connect() {
       currentWindow = m.id;
       $('titleText').textContent = winLabel(m.title, m.sshHost).name;
       if (mode === 'ssh') setMode('chat');
+      // On the terminal tab, the picked conversation's terminal replaces the one on screen.
+      if (mode === 'term') termAttach();
       send({ t: 'windows' });
     }
     else if (m.t === 'menu') showMenu(m.kind, m.items, m.max);

@@ -1309,6 +1309,8 @@ class Session {
       this.targetId = picked.id;
       this.winTitle = picked.title;
       this.emit({ t: 'attached', id: picked.id, title: picked.title, sshHost: '' });
+      // On the terminal tab the phone reopens the terminal itself; leaving the mode here would stop its output.
+      if (this.mode === 'term') return;
       await this.setMode('chat');
       this.emitClaudeChat(box.snapshot());
       return;
