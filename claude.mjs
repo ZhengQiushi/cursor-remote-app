@@ -6,6 +6,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { DATA_DIR } from './auth.mjs';
 
 const MODE_OPTIONS = [
   { value: 'default', label: 'Default' },
@@ -176,6 +177,24 @@ function projectDirKey(cwd) {
 
 // The conversation's topic: the first thing the person typed, read from its transcript. Claude Code's
 // derived name (ai-tutor-web-96) is only a counter, and command lines (/model) are not topics.
+// A session's topic is pinned the first time it is read, so it never changes afterwards, even if the
+// transcript is later rewritten or a newer message comes first. Kept per session id.
+const TOPIC_FILE = path.join(DATA_DIR, 'topics.json');
+function readTopics() {
+  try { return JSON.parse(fs.readFileSync(TOPIC_FILE, 'utf8')) || {}; } catch { return {}; }
+}
+export function pinnedTopic(sessionId, file) {
+  if (!sessionId) return topicOf(file);
+  const pins = readTopics();
+  if (pins[sessionId]) return pins[sessionId];
+  const topic = topicOf(file);
+  if (!topic) return '';
+  pins[sessionId] = topic;
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(TOPIC_FILE, JSON.stringify(pins, null, 2), { mode: 0o600 });
+  return topic;
+}
+
 export function topicOf(file) {
   let head;
   try { head = fs.readFileSync(file, 'utf8').split('\n').slice(0, 400); } catch { return ''; }
@@ -189,7 +208,8 @@ export function topicOf(file) {
       : (Array.isArray(content) ? content.find(c => c?.type === 'text')?.text : '');
     const clean = String(text || '').trim();
     if (!clean || clean.startsWith('<') || clean.startsWith('[Request interrupted')) continue; // wrappers, not the person's ask
-    return clean.replace(/\s+/g, ' ').slice(0, 60);
+    // A topic can be a pasted key or token; it is shown on the phone, so those never go in.
+    return clean.replace(/\s+/g, ' ').replace(/\b(sk|pk|ghp|xox[bp])[-_][A-Za-z0-9_-]{8,}/g, '[密钥已隐藏]').slice(0, 60);
   }
   return '';
 }
@@ -204,7 +224,7 @@ function listSessionFiles(cwd) {
       let st;
       try { st = fs.statSync(full); } catch { return null; }
       const id = n.replace(/\.jsonl$/, '');
-      const title = topicOf(full) || id.slice(0, 8);
+      const title = pinnedTopic(id, full) || id.slice(0, 8);
       return { id, title, mtime: st.mtimeMs };
     })
     .filter(Boolean)
@@ -1001,7 +1021,7 @@ export function listClaudeClients() {
     if (meta.messagingSocketPath && !fs.existsSync(meta.messagingSocketPath)) continue;
     const cwd = meta.cwd || '';
     const base = path.basename(cwd) || meta.name || `claude-${meta.pid}`;
-    const topic = topicOf(transcriptPath(cwd, meta.sessionId));
+    const topic = pinnedTopic(meta.sessionId, transcriptPath(cwd, meta.sessionId));
     rows.push({
       id: meta.sessionId,
       pid: meta.pid,
